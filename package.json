@@ -1,0 +1,80 @@
+{
+  "name": "cache-hub",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "零运行时依赖的 Node.js 多层缓存库，统一工作区所有项目的缓存基础设施",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "types": "./dist/types/index.d.ts"
+    },
+    "./multi-level": {
+      "import": "./dist/esm/multi-level-cache.js",
+      "require": "./dist/cjs/multi-level-cache.js",
+      "types": "./dist/types/multi-level-cache.d.ts"
+    },
+    "./redis": {
+      "import": "./dist/esm/redis-adapter.js",
+      "require": "./dist/cjs/redis-adapter.js",
+      "types": "./dist/types/redis-adapter.d.ts"
+    },
+    "./function-cache": {
+      "import": "./dist/esm/function-cache.js",
+      "require": "./dist/cjs/function-cache.js",
+      "types": "./dist/types/function-cache.d.ts"
+    },
+    "./distributed": {
+      "import": "./dist/esm/distributed-invalidator.js",
+      "require": "./dist/cjs/distributed-invalidator.js",
+      "types": "./dist/types/distributed-invalidator.d.ts"
+    },
+    "./stringify": {
+      "import": "./dist/esm/stable-stringify.js",
+      "require": "./dist/cjs/stable-stringify.js",
+      "types": "./dist/types/stable-stringify.d.ts"
+    },
+    "./read-through": {
+      "import": "./dist/esm/read-through.js",
+      "require": "./dist/cjs/read-through.js",
+      "types": "./dist/types/read-through.d.ts"
+    }
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "dist"
+  ],
+  "peerDependencies": {
+    "ioredis": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "rimraf": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "rspress": "^1.47.1"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:coverage": "vitest run --config vitest.integration.config.ts --coverage",
+    "build": "rimraf dist && npm run build:esm && npm run build:cjs && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:cjs": "node scripts/build-cjs.mjs",
+    "typecheck": "tsc --noEmit",
+    "docs:dev": "rspress dev --config website/rspress.config.ts",
+    "docs:build": "rspress build --config website/rspress.config.ts",
+    "docs:preview": "rspress preview --config website/rspress.config.ts"
+  },
+  "dependencies": {}
+}

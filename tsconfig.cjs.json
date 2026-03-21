@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2020",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "outDir": "dist/cjs",
+    "declaration": false,
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "noEmitOnError": false,
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"],
+}
