@@ -1,27 +1,49 @@
-# Changelog
+# 变更日志 (CHANGELOG)
 
-All notable changes to this project will be documented in this file.
-
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-> 📖 每个版本的完整变更详情位于 [`changelogs/`](./changelogs/) 目录。
+> **说明**: 版本概览索引，详细变更见 [changelogs/](./changelogs/) 目录  
+> **最后更新**: 2026-03-22
 
 ---
 
-## [1.0.0] - 2026-03-22
+## 📁 文件说明
 
-🎉 首个正式发布版本。零运行时依赖的 Node.js 多层缓存库，统一工作区所有项目的缓存基础设施。
+| 文件/目录 | 用途 | 关系 |
+|----------|------|------|
+| `CHANGELOG.md` | 版本概览索引 | 本文件，仅存储版本摘要表，保持简洁 |
+| `changelogs/` | 详细变更 | 每个版本一个文件，包含完整变更内容 + 后续补丁 |
 
-[→ 查看完整变更详情](./changelogs/v1.0.0.md)
+**设计理念**:
+- 本文件（CHANGELOG.md）作为**纯索引**，快速了解版本历史，永远不膨胀
+- `changelogs/vX.Y.Z.md` 作为**详情**，记录完整变更内容 + 后续补丁
+- 所有详细变更（核心变更、Bug 修复清单、后续补丁等）**只写入** `changelogs/vX.Y.Z.md`
+- 本文件仅更新版本概览表中对应行的摘要文字
 
 ---
 
-## 格式说明
+## 版本概览
 
-- **Added**：新功能
-- **Changed**：现有功能的非破坏性变更
-- **Fixed**：Bug 修复
-- **Deprecated**：已弃用功能（将在未来版本移除）
-- **Removed**：已移除功能（Major 版本）
-- **Security**：安全修复
+| 版本 | 日期 | 变更摘要 | 详细 |
+|------|------|---------|------|
+| [v1.0.0](./changelogs/v1.0.0.md) | 2026-03-22 | 🎉 首个正式发布版本。零运行时依赖的 Node.js 多层缓存库，统一工作区所有项目的缓存基础设施 | [查看](./changelogs/v1.0.0.md) |
+
+---
+
+## 变更统计
+
+| 版本 | 新增 | 变更 | 修复 | 移除 |
+|------|------|------|------|------|
+| v1.0.0 | 初始版本 | - | - | - |
+
+---
+
+## 维护说明
+
+- **版本策略**: [语义化版本](https://semver.org/lang/zh-CN/)
+- **详细变更**: 每个版本的详细变更见 `changelogs/vX.Y.Z.md`
+- **后续补丁**: PATCH 级修复追加到对应 `changelogs/vX.Y.0.md` 的"后续补丁"章节（本文件不更新）
+- **快速定位**: 使用版本概览表的链接直接跳转
+- **本文件定位**: 纯索引，禁止在此展开详细变更内容
+
+---
+
+**最后更新**: 2026-03-22
