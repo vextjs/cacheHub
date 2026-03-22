@@ -39,7 +39,7 @@ export default defineConfig({
       {
         icon: "github",
         mode: "link",
-        content: "https://github.com/your-org/cache-hub",
+        content: "https://github.com/vextjs/cacheHub",
       },
     ],
     footer: {

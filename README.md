@@ -46,7 +46,7 @@ import { MemoryCache } from 'cache-hub';
 
 const cache = new MemoryCache({
     maxEntries: 1000,       // 最多 1000 条
-    ttl: 60_000,            // 默认 TTL 60 秒
+    defaultTtl: 60_000,     // 默认 TTL 60 秒
     enableStats: true,
 });
 
@@ -63,7 +63,7 @@ console.log(stats.hitRate);  // 0~1 命中率
 import { MemoryCache } from 'cache-hub';
 import { readThrough } from 'cache-hub/read-through';
 
-const cache = new MemoryCache({ ttl: 30_000 });
+const cache = new MemoryCache({ defaultTtl: 30_000 });
 
 // 缓存命中直返，未命中执行 fetcher 并写缓存
 // 相同 key 的并发请求共享同一 Promise（并发去重）
@@ -102,7 +102,7 @@ import { MemoryCache } from 'cache-hub';
 import { MultiLevelCache } from 'cache-hub/multi-level';
 import { createRedisCacheAdapter } from 'cache-hub/redis';
 
-const local = new MemoryCache({ maxEntries: 500, ttl: 30_000 });
+const local = new MemoryCache({ maxEntries: 500, defaultTtl: 30_000 });
 const remote = createRedisCacheAdapter('redis://localhost:6379');
 
 const cache = new MultiLevelCache({
@@ -130,12 +130,12 @@ const local = new MemoryCache({ maxEntries: 1000 });
 // 多个服务实例各自持有本地缓存，通过 Redis Pub/Sub 广播失效
 const invalidator = new DistributedCacheInvalidator({
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
-    watchedCaches: [local],
+    cache: local,
     channel: 'app:cache-invalidation',
 });
 
-// 发布失效事件，其他实例收到后自动清除本地缓存
-await invalidator.invalidate(['user:1', 'user:2']);
+// 广播失效事件（支持通配符 *），其他实例收到后自动对本地缓存执行 delPattern
+await invalidator.invalidate('user:*');
 
 // 应用退出时关闭连接
 await invalidator.close();
@@ -158,11 +158,11 @@ import type { CacheLike, CacheStats, MemoryCacheOptions } from 'cache-hub';
 
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `maxEntries` | `number` | `Infinity` | 最大条目数，超限 LRU 淘汰 |
-| `maxMemory` | `number` | `Infinity` | 最大内存（字节估算），超限 LRU 淘汰 |
-| `ttl` | `number` | `0`（不过期）| 默认 TTL（毫秒） |
+| `maxEntries` | `number` | `10000` | 最大条目数，超限 LRU 淘汰 |
+| `maxMemory` | `number` | `0` | 最大内存（字节估算），超限 LRU 淘汰；`0` 表示无内存限制 |
+| `defaultTtl` | `number` | `0`（不过期）| 默认 TTL（毫秒） |
 | `cleanupInterval` | `number` | `0`（不清理）| 周期清理间隔（毫秒） |
-| `enableStats` | `boolean` | `false` | 开启命中率统计 |
+| `enableStats` | `boolean` | `true` | 开启命中率统计 |
 | `enableTags` | `boolean` | `false` | 开启标签索引，支持 `invalidateByTag` |
 | `enabled` | `boolean` | `true` | `false` 时禁用缓存 |
 
@@ -171,20 +171,24 @@ import type { CacheLike, CacheStats, MemoryCacheOptions } from 'cache-hub';
 所有缓存实现均满足此接口，可互相替换：
 
 ```typescript
-interface CacheLike<V = unknown> {
-    get(key: string): V | undefined | Promise<V | undefined>;
-    set(key: string, value: V, ttl?: number): void | Promise<void>;
-    del(key: string): void | Promise<void>;
+interface CacheLike {
+    get<T = any>(key: string): T | undefined | Promise<T | undefined>;
+    set(key: string, value: any, ttl?: number): void | Promise<void>;
+    del(key: string): boolean | Promise<boolean>;
     exists(key: string): boolean | Promise<boolean>;
     has(key: string): boolean | Promise<boolean>;         // exists 的同步别名
     clear(): void | Promise<void>;
-    keys(): string[] | Promise<string[]>;
-    getMany(keys: string[]): Map<string, V> | Promise<Map<string, V>>;
-    setMany(entries: Map<string, V>, ttl?: number): void | Promise<void>;
-    delMany(keys: string[]): void | Promise<void>;
-    delPattern(pattern: string): void | Promise<void>;   // 支持 * 通配符
-    getStats(): CacheStats;
-    destroy(): void | Promise<void>;
+    keys(pattern?: string): string[] | Promise<string[]>;
+    getMany(keys: string[]): Record<string, any> | Promise<Record<string, any>>;
+    setMany(entries: Record<string, any>, ttl?: number): boolean | Promise<boolean>;
+    delMany(keys: string[]): number | Promise<number>;
+    delPattern(pattern: string): number | Promise<number>;   // 支持 * 通配符
+    // 可选扩展
+    invalidateByTag?(tag: string): void | Promise<void>;
+    getStats?(): CacheStats;
+    resetStats?(): void;
+    destroy?(): void;
+    setLockManager?(lm: LockManager): void;
 }
 ```
 
@@ -196,7 +200,7 @@ interface CacheLike<V = unknown> {
 import { readThrough } from 'cache-hub/read-through';
 
 function readThrough<V>(
-    cache: CacheLike<V>,
+    cache: CacheLike,
     ttl: number,
     key: string,
     fetcher: () => Promise<V>
@@ -220,11 +224,11 @@ new MultiLevelCache(options: MultiLevelCacheOptions)
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `local` | `CacheLike` | 必填 | L1 本地缓存 |
-| `remote` | `CacheLike` | 必填 | L2 远端缓存 |
+| `remote` | `CacheLike` | — | L2 远端缓存（可选，未传时作为单级本地缓存运行）|
 | `writePolicy` | `'both' \| 'local-first-async-remote'` | `'both'` | 写策略 |
 | `backfillOnRemoteHit` | `boolean` | `true` | L2 命中时回填 L1 |
 | `remoteTimeoutMs` | `number` | `50` | 远端超时（毫秒），超时降级不报错 |
-| `publish` | `(keys: string[]) => void` | — | 分布式失效广播回调 |
+| `publish` | `(msg: { type: string; pattern: string; ts: number }) => void` | — | `delPattern` 时触发的分布式失效广播回调 |
 
 ---
 
@@ -270,13 +274,13 @@ const cachedFn = withCache(asyncFn, {
 #### `FunctionCache` 类
 
 ```typescript
-const fc = new FunctionCache({ cache, ttl: 30_000 });
+const fc = new FunctionCache(cache, { ttl: 30_000 });
 
 fc.register('getUser', async (id: number) => db.findUser(id));
 fc.register('getProduct', async (id: number) => db.findProduct(id), { ttl: 10_000 });
 
-const user = await fc.execute('getUser', [1]);
-await fc.invalidate('getUser', [1]);  // 使指定参数的缓存失效
+const user = await fc.execute('getUser', 1);
+await fc.invalidate('getUser', 1);  // 使指定参数的缓存失效
 
 const stats = fc.getStats();  // { getUser: { hits, misses, ... } }
 ```
@@ -293,19 +297,19 @@ new DistributedCacheInvalidator(options: DistributedInvalidatorOptions)
 
 | 选项 | 类型 | 说明 |
 |------|------|------|
-| `redisUrl` | `string` | Redis URL，与 `redis` 二选一 |
+| `cache` | `CacheLike` | 必填，接收失效消息时对该实例执行 `delPattern` |
+| `redisUrl` | `string` | Redis URL，与 `redis` 二选一，均未提供时默认 `redis://localhost:6379` |
 | `redis` | `ioredis` | 已有 Redis 连接，与 `redisUrl` 二选一 |
-| `watchedCaches` | `CacheLike[]` | 接收到失效消息时清除这些缓存 |
-| `channel` | `string` | Pub/Sub 频道名，默认 `'cache-hub:invalidation'` |
+| `channel` | `string` | Pub/Sub 频道名，默认 `'cache-hub:invalidate'` |
 | `instanceId` | `string` | 实例唯一 ID，用于过滤自身消息（默认随机生成） |
 
 ```typescript
-// 发布失效事件
-await invalidator.invalidate(['key1', 'key2']);
+// 广播失效事件（支持通配符 *）
+await invalidator.invalidate('user:*');
 
 // 查看统计
 const stats = invalidator.getStats();
-// { published: 5, received: 12, selfFiltered: 5 }
+// { messagesSent: 5, messagesReceived: 12, invalidationsTriggered: 7, errors: 0, instanceId: '...', channel: '...' }
 
 // 关闭连接
 await invalidator.close();
@@ -341,7 +345,7 @@ stableStringify(value, {
 ## 测试
 
 ```bash
-# 单元测试（440 个，无需外部依赖）
+# 全量测试（470 个，集成测试在无 Redis 时自动跳过）
 npm test
 
 # 单元测试 + 覆盖率报告

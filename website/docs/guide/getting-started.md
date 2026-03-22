@@ -25,7 +25,7 @@ import { MemoryCache } from 'cache-hub';
 
 const cache = new MemoryCache({
     maxEntries: 1000,     // 最多缓存 1000 条，超限自动 LRU 淘汰
-    ttl: 60_000,          // 默认 TTL 60 秒（毫秒单位）
+    defaultTtl: 60_000,   // 默认 TTL 60 秒（毫秒单位）
     enableStats: true,    // 开启命中率统计
 });
 
@@ -54,14 +54,14 @@ console.log(stats.misses);    // 未命中次数
 
 ```typescript
 // 批量写入
-await cache.setMany(new Map([
-    ['user:1', { name: 'Alice' }],
-    ['user:2', { name: 'Bob' }],
-]), 30_000); // 自定义 TTL
+await cache.setMany({
+    'user:1': { name: 'Alice' },
+    'user:2': { name: 'Bob' },
+}, 30_000); // 自定义 TTL
 
 // 批量读取
 const results = await cache.getMany(['user:1', 'user:2', 'user:3']);
-// → Map { 'user:1' => {...}, 'user:2' => {...} }（不存在的 key 不在 Map 中）
+// → { 'user:1': {...}, 'user:2': {...} }（不存在的 key 不出现在结果对象中）
 
 // 模式删除（* 通配符）
 await cache.delPattern('user:*');  // 删除所有以 user: 开头的缓存
@@ -145,7 +145,7 @@ import { FunctionCache } from 'cache-hub/function-cache';
 import { MemoryCache } from 'cache-hub';
 
 const cache = new MemoryCache({ maxEntries: 1000 });
-const fc = new FunctionCache({ cache, ttl: 60_000 });
+const fc = new FunctionCache(cache, { ttl: 60_000 });
 
 // 注册函数
 fc.register('getUser', async (id: number) => db.findUser(id));
@@ -154,10 +154,10 @@ fc.register('getProduct', async (id: number) => db.findProduct(id), {
 });
 
 // 执行（自动缓存）
-const user = await fc.execute('getUser', [1]);
+const user = await fc.execute('getUser', 1);
 
 // 精确失效某个参数对应的缓存
-await fc.invalidate('getUser', [1]);
+await fc.invalidate('getUser', 1);
 
 // 查看各函数的统计
 const stats = fc.getStats();
@@ -177,7 +177,7 @@ import { createRedisCacheAdapter } from 'cache-hub/redis';
 
 const local = new MemoryCache({
     maxEntries: 500,
-    ttl: 30_000,      // L1 缓存 30 秒
+    defaultTtl: 30_000,   // L1 缓存 30 秒
 });
 
 const remote = createRedisCacheAdapter(
@@ -217,19 +217,19 @@ const local = new MemoryCache({ maxEntries: 1000 });
 
 const invalidator = new DistributedCacheInvalidator({
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
-    watchedCaches: [local],               // 监听这些本地缓存
+    cache: local,                         // 收到失效消息时操作的缓存实例
     channel: 'myapp:cache-invalidation',  // 自定义频道名
 });
 
-// 某实例更新数据后，广播失效
-// 其他实例收到消息后会自动清除本地对应的缓存
-await invalidator.invalidate(['user:1', 'user:2']);
+// 某实例更新数据后，广播失效（支持通配符 *）
+// 其他实例收到消息后会自动对本地缓存执行 delPattern
+await invalidator.invalidate('user:*');
 
 // 查看统计
 const stats = invalidator.getStats();
-console.log(stats.published);    // 本实例发布的消息数
-console.log(stats.received);     // 收到的消息数（含其他实例）
-console.log(stats.selfFiltered); // 自身发出被过滤掉的消息数
+console.log(stats.messagesSent);            // 本实例发布的失效消息数
+console.log(stats.messagesReceived);        // 收到的消息总数（含所有实例）
+console.log(stats.invalidationsTriggered);  // 实际触发 delPattern 的次数
 
 // 程序退出时关闭
 await invalidator.close();
@@ -247,19 +247,19 @@ import { MultiLevelCache } from 'cache-hub/multi-level';
 import { createRedisCacheAdapter } from 'cache-hub/redis';
 import { DistributedCacheInvalidator } from 'cache-hub/distributed';
 
-const local = new MemoryCache({ maxEntries: 500, ttl: 30_000 });
+const local = new MemoryCache({ maxEntries: 500, defaultTtl: 30_000 });
 const remote = createRedisCacheAdapter(process.env.REDIS_URL!);
 
 const invalidator = new DistributedCacheInvalidator({
     redisUrl: process.env.REDIS_URL!,
-    watchedCaches: [local],
+    cache: local,
 });
 
 const cache = new MultiLevelCache({
     local,
     remote,
-    // 写入时广播失效，确保其他实例的 L1 缓存被清除
-    publish: (keys) => invalidator.invalidate(keys),
+    // delPattern 时广播失效，确保其他实例的 L1 缓存被清除
+    publish: (msg) => invalidator.invalidate(msg.pattern),
 });
 
 // 写入时：L1 + L2 双写，并广播失效给其他实例
@@ -275,4 +275,4 @@ await remote.close();
 ## 下一步
 
 - 查看 [API 参考](/guide/api-reference) 了解所有配置项和方法
-- 查看 [README](https://github.com/your-org/cache-hub#readme) 了解完整选项说明
+- 查看 [README](https://github.com/vextjs/cacheHub#readme) 了解完整选项说明

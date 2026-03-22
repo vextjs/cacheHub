@@ -2,49 +2,53 @@
   "name": "cache-hub",
   "version": "1.0.0",
   "type": "module",
+  "main": "./dist/cjs/index.js",
+  "types": "./dist/types/index.d.ts",
   "description": "零运行时依赖的 Node.js 多层缓存库，统一工作区所有项目的缓存基础设施",
   "exports": {
     ".": {
+      "types": "./dist/types/index.d.ts",
       "import": "./dist/esm/index.js",
-      "require": "./dist/cjs/index.js",
-      "types": "./dist/types/index.d.ts"
+      "require": "./dist/cjs/index.js"
     },
     "./multi-level": {
+      "types": "./dist/types/multi-level-cache.d.ts",
       "import": "./dist/esm/multi-level-cache.js",
-      "require": "./dist/cjs/multi-level-cache.js",
-      "types": "./dist/types/multi-level-cache.d.ts"
+      "require": "./dist/cjs/multi-level-cache.js"
     },
     "./redis": {
+      "types": "./dist/types/redis-adapter.d.ts",
       "import": "./dist/esm/redis-adapter.js",
-      "require": "./dist/cjs/redis-adapter.js",
-      "types": "./dist/types/redis-adapter.d.ts"
+      "require": "./dist/cjs/redis-adapter.js"
     },
     "./function-cache": {
+      "types": "./dist/types/function-cache.d.ts",
       "import": "./dist/esm/function-cache.js",
-      "require": "./dist/cjs/function-cache.js",
-      "types": "./dist/types/function-cache.d.ts"
+      "require": "./dist/cjs/function-cache.js"
     },
     "./distributed": {
+      "types": "./dist/types/distributed-invalidator.d.ts",
       "import": "./dist/esm/distributed-invalidator.js",
-      "require": "./dist/cjs/distributed-invalidator.js",
-      "types": "./dist/types/distributed-invalidator.d.ts"
+      "require": "./dist/cjs/distributed-invalidator.js"
     },
     "./stringify": {
+      "types": "./dist/types/stable-stringify.d.ts",
       "import": "./dist/esm/stable-stringify.js",
-      "require": "./dist/cjs/stable-stringify.js",
-      "types": "./dist/types/stable-stringify.d.ts"
+      "require": "./dist/cjs/stable-stringify.js"
     },
     "./read-through": {
+      "types": "./dist/types/read-through.d.ts",
       "import": "./dist/esm/read-through.js",
-      "require": "./dist/cjs/read-through.js",
-      "types": "./dist/types/read-through.d.ts"
+      "require": "./dist/cjs/read-through.js"
     }
   },
   "engines": {
     "node": ">=16"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md",
+    "changelogs"
   ],
   "peerDependencies": {
     "ioredis": ">=5.0.0"
@@ -72,6 +76,7 @@
     "build:esm": "tsc -p tsconfig.json",
     "build:cjs": "node scripts/build-cjs.mjs",
     "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run build",
     "docs:dev": "rspress dev --config website/rspress.config.ts",
     "docs:build": "rspress build --config website/rspress.config.ts",
     "docs:preview": "rspress preview --config website/rspress.config.ts"

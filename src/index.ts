@@ -15,6 +15,7 @@ export type {
 
 // 核心实现
 export { MemoryCache } from "./memory-cache.js";
+export type { SetOptions } from "./memory-cache.js";
 
 // 工具函数
 export { stableStringify } from "./stable-stringify.js";
