@@ -1,6 +1,6 @@
 {
   "name": "cache-hub",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "types": "./dist/types/index.d.ts",
@@ -50,6 +50,9 @@
     "CHANGELOG.md",
     "changelogs"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "peerDependencies": {
     "ioredis": ">=5.0.0"
   },
