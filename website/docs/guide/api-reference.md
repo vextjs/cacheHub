@@ -66,7 +66,9 @@ interface CacheLike {
     setMany(entries: Record<string, any>, ttl?: number): boolean | Promise<boolean>;
     delMany(keys: string[]): number | Promise<number>;
     delPattern(pattern: string): number | Promise<number>; // 支持 * 通配符
-    // ── 可选扩展（5 个）──
+    // ── 可选扩展（7 个）──
+    getRemainingTtl?(key: string): number | null | undefined | Promise<number | null | undefined>;
+    getRemainingTtlMany?(keys: string[]): Record<string, number | null> | Promise<Record<string, number | null>>;
     invalidateByTag?(tag: string): void | Promise<void>;
     getStats?(): CacheStats;
     resetStats?(): void;
@@ -145,7 +147,7 @@ import { MultiLevelCache } from 'cache-hub/multi-level';
 | `local` | `CacheLike` | 必填 | L1 本地缓存实例 |
 | `remote` | `CacheLike` | — | L2 远端缓存实例（可选，未传时单级运行）|
 | `writePolicy` | `'both' \| 'local-first-async-remote'` | `'both'` | `'both'`：同步双写；`'local-first-async-remote'`：本地优先，异步写远端 |
-| `backfillOnRemoteHit` | `boolean` | `true` | L2 命中时自动回填 L1 |
+| `backfillOnRemoteHit` | `boolean` | `true` | L2 命中时回填 L1；远端支持 TTL 查询时保留剩余 TTL，不支持时使用 L1 的默认 TTL 策略 |
 | `remoteTimeoutMs` | `number` | `50` | 远端操作超时（毫秒），超时后降级，不抛错 |
 | `publish` | `(msg: { type: string; pattern: string; ts: number }) => void` | — | `delPattern` 时调用此回调广播失效事件（配合 `DistributedCacheInvalidator` 使用）|
 
@@ -156,7 +158,7 @@ get(key)
   ↓ 查 L1（本地）
   → 命中 → 返回
   → 未命中 → 查 L2（远端，含超时保护）
-              → 命中 → 回填 L1（若 backfillOnRemoteHit=true）→ 返回
+              → 命中 → 回填 L1（若 backfillOnRemoteHit=true；可查询 TTL 时保留剩余 TTL）→ 返回
               → 未命中 → 返回 undefined
 ```
 
@@ -254,6 +256,8 @@ function withCache<T extends (...args: any[]) => Promise<any>>(
 | `invalidateAll` | `() => Promise<void>` | 使该包装函数写入的全部缓存条目失效 |
 | `stats` | `() => WithCacheStats` | 获取调用统计（hits / misses / errors / hitRate）|
 
+`invalidateAll()` 基于包装函数实际成功写入的 key 精确失效，不会删除同一 `namespace:functionName:*` 前缀下由调用方手工写入的其他 key。
+
 ---
 
 ### `new FunctionCache(cache, options?)`
@@ -306,7 +310,7 @@ import { DistributedCacheInvalidator } from 'cache-hub/distributed';
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `invalidate` | `(pattern: string) => Promise<void>` | 向频道广播失效事件，其他实例收到后执行 `delPattern(pattern)` |
+| `invalidate` | `(pattern: string) => Promise<void>` | 先失效当前实例，再向频道广播失效事件；其他实例收到后执行 `delPattern(pattern)` |
 | `getStats` | `() => InvalidatorStats` | 获取统计信息 |
 | `close` | `() => Promise<void>` | 关闭 pub/sub 连接（外部传入的连接不关闭）|
 
@@ -316,7 +320,7 @@ import { DistributedCacheInvalidator } from 'cache-hub/distributed';
 interface InvalidatorStats {
     messagesSent: number;            // 本实例通过 publish 发出的失效消息数
     messagesReceived: number;        // 从频道接收到的消息总数（含所有实例）
-    invalidationsTriggered: number;  // 实际触发 delPattern 的次数（过滤自身消息后）
+    invalidationsTriggered: number;  // 实际触发 delPattern 的次数（含本地主动失效与远端消息触发）
     errors: number;                  // 错误次数（发布/订阅/消息解析/失效处理）
     instanceId: string;              // 当前实例 ID
     channel: string;                 // 订阅的频道名

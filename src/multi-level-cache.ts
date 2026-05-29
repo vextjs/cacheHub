@@ -11,7 +11,7 @@
  * 来源：技术方案 §6
  */
 
-import type { CacheLike, CacheStats } from "./types.js";
+import type { CacheLike, CacheRemainingTtl, CacheStats } from "./types.js";
 
 // ── 类型定义 ──
 
@@ -26,13 +26,20 @@ export interface MultiLevelCacheOptions {
    * - 'local-first-async-remote'：先同步写 L1，再异步写 L2（fire-and-forget）
    */
   writePolicy?: "both" | "local-first-async-remote";
-  /** L2 命中后是否回填 L1（默认 true） */
+  /** L2 命中后是否回填 L1；TTL 不可查询时使用 L1 默认 TTL（默认 true） */
   backfillOnRemoteHit?: boolean;
   /** 远端 get() 操作超时（毫秒），超时则降级为 miss（默认 50） */
   remoteTimeoutMs?: number;
   /** 分布式失效发布函数（可选，delPattern 时调用） */
   publish?: (msg: { type: string; pattern: string; ts: number }) => void;
 }
+
+function normalizeBackfillTtl(ttl: CacheRemainingTtl): number {
+  return ttl === null ? 0 : ttl;
+}
+
+const UNKNOWN_BACKFILL_TTL = Symbol("unknown-backfill-ttl");
+type ResolvedBackfillTtl = number | typeof UNKNOWN_BACKFILL_TTL;
 
 // ── 辅助函数 ──
 
@@ -78,6 +85,72 @@ export class MultiLevelCache implements CacheLike {
     this._publish = options.publish;
   }
 
+  private async _resolveBackfillTtl(
+    key: string,
+  ): Promise<ResolvedBackfillTtl | undefined> {
+    if (!this._remote?.getRemainingTtl) {
+      return UNKNOWN_BACKFILL_TTL;
+    }
+
+    try {
+      const ttl = await this._remote.getRemainingTtl(key);
+      if (ttl === undefined) {
+        return undefined;
+      }
+      return normalizeBackfillTtl(ttl);
+    } catch {
+      return UNKNOWN_BACKFILL_TTL;
+    }
+  }
+
+  private async _resolveBackfillTtls(
+    keys: string[],
+  ): Promise<Record<string, ResolvedBackfillTtl>> {
+    if (!this._remote || keys.length === 0) {
+      return {};
+    }
+
+    if (this._remote.getRemainingTtlMany) {
+      try {
+        const batchTtls = await this._remote.getRemainingTtlMany(keys);
+        const normalized: Record<string, ResolvedBackfillTtl> = {};
+        for (const [key, ttl] of Object.entries(batchTtls)) {
+          normalized[key] = normalizeBackfillTtl(ttl);
+        }
+        return normalized;
+      } catch {
+        // 回退到逐键查询
+      }
+    }
+
+    if (!this._remote.getRemainingTtl) {
+      return Object.fromEntries(
+        keys.map((key) => [key, UNKNOWN_BACKFILL_TTL]),
+      );
+    }
+
+    const result: Record<string, ResolvedBackfillTtl> = {};
+    for (const key of keys) {
+      const ttl = await this._resolveBackfillTtl(key);
+      if (ttl !== undefined) {
+        result[key] = ttl;
+      }
+    }
+    return result;
+  }
+
+  private async _setLocalBackfill(
+    key: string,
+    value: any,
+    ttl: ResolvedBackfillTtl,
+  ): Promise<void> {
+    if (ttl === UNKNOWN_BACKFILL_TTL) {
+      await this._local.set(key, value);
+      return;
+    }
+    await this._local.set(key, value, ttl);
+  }
+
   // ── get ──
 
   async get<T = any>(key: string): Promise<T | undefined> {
@@ -111,7 +184,10 @@ export class MultiLevelCache implements CacheLike {
     // 回填 L1（backfillOnRemoteHit=true 时）
     if (this._backfillOnRemoteHit) {
       try {
-        await this._local.set(key, l2Value);
+        const ttl = await this._resolveBackfillTtl(key);
+        if (ttl !== undefined) {
+          await this._setLocalBackfill(key, l2Value, ttl);
+        }
       } catch {
         // 回填失败静默忽略：不影响本次返回值
       }
@@ -235,7 +311,15 @@ export class MultiLevelCache implements CacheLike {
       }
       if (Object.keys(toBackfill).length > 0) {
         try {
-          await this._local.setMany(toBackfill);
+          const backfillTtls = await this._resolveBackfillTtls(
+            Object.keys(toBackfill),
+          );
+          for (const key of Object.keys(toBackfill)) {
+            const ttl = backfillTtls[key];
+            if (ttl !== undefined) {
+              await this._setLocalBackfill(key, toBackfill[key], ttl);
+            }
+          }
         } catch {
           // 回填失败静默忽略
         }

@@ -19,6 +19,7 @@ import type { CacheLike } from "./types.js";
 
 /** 键长度超过此阈值时使用 SHA-256 压缩（A09） */
 const KEY_MAX_LENGTH = 1024;
+const KNOWN_KEYS_PRUNE_INTERVAL = 1000;
 
 // ── 辅助函数 ──
 
@@ -115,12 +116,14 @@ export function withCache<T extends (...args: any[]) => Promise<any>>(
   const namespace = options?.namespace ?? "fn";
   const condition = options?.condition;
   const enableStats = options?.enableStats !== false;
+  const fnName = fn.name || "anonymous";
 
   // 实例级 in-flight 去重表（不同于 readThrough 的模块级表）
   const inflight = new Map<string, Promise<any>>();
 
-  // 该包装函数曾写入的键集合（用于 invalidateAll）
+  // 精确记录本包装函数实际写入的键，确保 invalidateAll 不误删同前缀外部键。
   const knownKeys = new Set<string>();
+  let writesSincePrune = 0;
 
   // 统计计数器
   let hits = 0;
@@ -132,8 +135,29 @@ export function withCache<T extends (...args: any[]) => Promise<any>>(
     if (options?.keyBuilder) {
       return options.keyBuilder(...args);
     }
-    const fnName = fn.name || "anonymous";
     return buildCacheKey(namespace, fnName, args as unknown[]);
+  }
+
+  async function pruneKnownKeys(): Promise<void> {
+    for (const key of [...knownKeys]) {
+      try {
+        if (!(await cache.exists(key))) {
+          knownKeys.delete(key);
+        }
+      } catch {
+        // 无法确认时保留 key，避免因底层缓存瞬时错误漏删真实条目。
+      }
+    }
+  }
+
+  async function trackWrittenKey(key: string): Promise<void> {
+    knownKeys.add(key);
+    writesSincePrune++;
+    /* v8 ignore next 4 -- 大规模写入路径的防护分支，功能由 invalidateAll 前清理覆盖 */
+    if (writesSincePrune >= KNOWN_KEYS_PRUNE_INTERVAL) {
+      writesSincePrune = 0;
+      await pruneKnownKeys();
+    }
   }
 
   // 包装函数主体
@@ -172,7 +196,7 @@ export function withCache<T extends (...args: any[]) => Promise<any>>(
       if (!condition || condition(result)) {
         try {
           await cache.set(key, result, ttl);
-          knownKeys.add(key);
+          await trackWrittenKey(key);
         } catch {
           // 缓存写入失败静默忽略：不影响调用方获取数据
         }
@@ -205,7 +229,7 @@ export function withCache<T extends (...args: any[]) => Promise<any>>(
     },
 
     async invalidateAll(): Promise<void> {
-      // 按记录顺序逐个删除
+      await pruneKnownKeys();
       for (const key of knownKeys) {
         try {
           await cache.del(key);

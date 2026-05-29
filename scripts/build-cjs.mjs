@@ -27,17 +27,41 @@ console.log("[build-cjs] 运行 tsc -p tsconfig.cjs.json ...");
 
 const tscResult = spawnSync("npx", ["tsc", "-p", "tsconfig.cjs.json"], {
   cwd: root,
-  stdio: "inherit",
+  encoding: "utf-8",
   shell: true,
 });
 
 // TS1343（import.meta 不兼容 CJS module 模式）是预期中的警告；
 // 其他非零退出才视为真正失败（如 TS 类型错误、配置错误等）。
 if (tscResult.status !== 0 && tscResult.status !== null) {
-  // 若仅有 TS1343 则继续，否则退出
-  console.warn(
-    `[build-cjs] tsc 退出码 ${tscResult.status}，将尝试继续（TS1343 可忽略）`,
+  const combinedOutput = `${tscResult.stdout ?? ""}${tscResult.stderr ?? ""}`;
+  const diagnosticLines = combinedOutput
+    .split(/\r?\n/)
+    .filter((line) => /error TS\d+:/.test(line));
+  const unexpectedDiagnostics = diagnosticLines.filter(
+    (line) => !/error TS1343:/.test(line),
   );
+
+  if (unexpectedDiagnostics.length > 0) {
+    if (tscResult.stdout) {
+      process.stdout.write(tscResult.stdout);
+    }
+    if (tscResult.stderr) {
+      process.stderr.write(tscResult.stderr);
+    }
+    process.exit(tscResult.status);
+  }
+
+  console.warn(
+    `[build-cjs] 已忽略 ${diagnosticLines.length} 条预期 TS1343 中间诊断，继续执行 CJS 修补。`,
+  );
+} else {
+  if (tscResult.stdout) {
+    process.stdout.write(tscResult.stdout);
+  }
+  if (tscResult.stderr) {
+    process.stderr.write(tscResult.stderr);
+  }
 }
 
 // ── Step 2: 替换 import.meta.url → __filename ─────────────────────────────────

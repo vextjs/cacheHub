@@ -188,19 +188,21 @@ const cache = new MultiLevelCache({
     local,
     remote,
     remoteTimeoutMs: 50,          // 远端超时 50ms，超时后降级到仅本地
-    backfillOnRemoteHit: true,    // L2 命中时自动回填 L1
+    backfillOnRemoteHit: true,    // L2 命中时回填 L1；可查询 TTL 时保留远端剩余 TTL
     writePolicy: 'both',          // 同步双写 L1 + L2
 });
 
 // 写入（同时写 L1 和 L2）
 await cache.set('session:abc', sessionData, 120_000);
 
-// 读取（先查 L1，L1 未命中查 L2，L2 命中时自动回填 L1）
+// 读取（先查 L1，L1 未命中查 L2，L2 命中时回填 L1）
 const session = await cache.get('session:abc');
 
 // 程序退出时关闭远端连接
 await remote.close();
 ```
+
+当远端实现支持 `getRemainingTtl/getRemainingTtlMany` 时，回填 L1 会保留 L2 的剩余 TTL；普通 `CacheLike` 远端不支持 TTL 查询时仍会回填，并使用 L1 的默认 TTL 策略。
 
 ---
 
@@ -221,8 +223,7 @@ const invalidator = new DistributedCacheInvalidator({
     channel: 'myapp:cache-invalidation',  // 自定义频道名
 });
 
-// 某实例更新数据后，广播失效（支持通配符 *）
-// 其他实例收到消息后会自动对本地缓存执行 delPattern
+// 某实例更新数据后，先失效当前实例，再广播给其他实例（支持通配符 *）
 await invalidator.invalidate('user:*');
 
 // 查看统计

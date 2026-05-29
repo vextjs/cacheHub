@@ -13,6 +13,8 @@
  * - 未命中返回 undefined（null 为有效缓存值，不视为 miss）
  * - TTL 统一使用毫秒
  */
+export type CacheRemainingTtl = number | null;
+
 export interface CacheLike {
     // ── 核心 CRUD（6 方法）──
     get<T = any>(key: string): T | undefined | Promise<T | undefined>;
@@ -36,6 +38,19 @@ export interface CacheLike {
     keys(pattern?: string): string[] | Promise<string[]>; // 兼容 Redis SCAN（异步）
 
     // ── 可选扩展 ──
+    /**
+     * 获取单个键的剩余 TTL（毫秒）。
+     * - `number`：剩余 TTL（> 0）
+     * - `null`：存在但永不过期
+     * - `undefined`：键不存在，或当前实现不支持 TTL 查询
+     */
+    getRemainingTtl?(key: string): CacheRemainingTtl | undefined | Promise<CacheRemainingTtl | undefined>;
+    /**
+     * 批量获取剩余 TTL。返回对象仅包含存在且可确定 TTL 语义的键：
+     * - 值为 `number`：剩余 TTL（毫秒）
+     * - 值为 `null`：存在且永不过期
+     */
+    getRemainingTtlMany?(keys: string[]): Record<string, CacheRemainingTtl> | Promise<Record<string, CacheRemainingTtl>>;
     invalidateByTag?(tag: string): void | Promise<void>;
     getStats?(): CacheStats;
     resetStats?(): void;

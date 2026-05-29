@@ -12,7 +12,7 @@
 
 - **零运行时依赖** — `dependencies` 永远为空，不会污染你的依赖树
 - **LRU + TTL 内存缓存** — 基于 ES6 `Map` 实现 O(1) 淘汰，支持双重容量限制（条目数 + 内存字节）
-- **多级缓存** — L1 本地 + L2 远端，自动回填、超时降级、写策略可配
+- **多级缓存** — L1 本地 + L2 远端，自动回填、TTL 保真、超时降级、写策略可配
 - **Redis 适配器** — 将 ioredis 包装为 `CacheLike`，SCAN 替代 KEYS，无阻塞
 - **函数装饰器** — `withCache` 一行代码缓存任意异步函数，并发去重 + 条件缓存
 - **分布式失效** — Redis Pub/Sub 广播跨实例缓存清除
@@ -109,7 +109,7 @@ const cache = new MultiLevelCache({
     local,
     remote,
     remoteTimeoutMs: 50,          // 远端超时降级，不影响可用性
-    backfillOnRemoteHit: true,    // L2 命中时自动回填 L1
+    backfillOnRemoteHit: true,    // L2 命中时回填 L1；可查询 TTL 时保留远端剩余 TTL
     writePolicy: 'both',          // 同步双写
 });
 
@@ -134,7 +134,7 @@ const invalidator = new DistributedCacheInvalidator({
     channel: 'app:cache-invalidation',
 });
 
-// 广播失效事件（支持通配符 *），其他实例收到后自动对本地缓存执行 delPattern
+// 当前实例会先失效本地缓存，再广播给其他实例执行 delPattern
 await invalidator.invalidate('user:*');
 
 // 应用退出时关闭连接
@@ -184,6 +184,8 @@ interface CacheLike {
     delMany(keys: string[]): number | Promise<number>;
     delPattern(pattern: string): number | Promise<number>;   // 支持 * 通配符
     // 可选扩展
+    getRemainingTtl?(key: string): number | null | undefined | Promise<number | null | undefined>;
+    getRemainingTtlMany?(keys: string[]): Record<string, number | null> | Promise<Record<string, number | null>>;
     invalidateByTag?(tag: string): void | Promise<void>;
     getStats?(): CacheStats;
     resetStats?(): void;
@@ -226,7 +228,7 @@ new MultiLevelCache(options: MultiLevelCacheOptions)
 | `local` | `CacheLike` | 必填 | L1 本地缓存 |
 | `remote` | `CacheLike` | — | L2 远端缓存（可选，未传时作为单级本地缓存运行）|
 | `writePolicy` | `'both' \| 'local-first-async-remote'` | `'both'` | 写策略 |
-| `backfillOnRemoteHit` | `boolean` | `true` | L2 命中时回填 L1 |
+| `backfillOnRemoteHit` | `boolean` | `true` | L2 命中时回填 L1；远端支持 TTL 查询时保留剩余 TTL，不支持时使用 L1 的默认 TTL 策略 |
 | `remoteTimeoutMs` | `number` | `50` | 远端超时（毫秒），超时降级不报错 |
 | `publish` | `(msg: { type: string; pattern: string; ts: number }) => void` | — | `delPattern` 时触发的分布式失效广播回调 |
 
@@ -284,6 +286,8 @@ await fc.invalidate('getUser', 1);  // 使指定参数的缓存失效
 
 const stats = fc.getStats();  // { getUser: { hits, misses, ... } }
 ```
+
+`withCache(fn).invalidateAll()` 只删除该包装函数实际写入的缓存键；即使底层缓存里存在相同 `namespace:functionName:*` 前缀的手工键，也不会被一并删除。
 
 ---
 
@@ -345,7 +349,7 @@ stableStringify(value, {
 ## 测试
 
 ```bash
-# 全量测试（470 个，集成测试在无 Redis 时自动跳过）
+# 全量测试（503 个，集成测试在无 Redis 时自动跳过）
 npm test
 
 # 单元测试 + 覆盖率报告

@@ -11,6 +11,7 @@
 
 import type {
   CacheLike,
+  CacheRemainingTtl,
   CacheStats,
   LockManager,
   MemoryCacheOptions,
@@ -329,6 +330,44 @@ export class MemoryCache implements CacheLike {
   }
 
   // ── 可选扩展 ──
+
+  getRemainingTtl(key: string): CacheRemainingTtl | undefined {
+    this._validateKey(key);
+    if (!this._options.enabled) {
+      return undefined;
+    }
+
+    const entry = this._store.get(key);
+    if (!entry) {
+      return undefined;
+    }
+
+    if (entry.expireAt !== null) {
+      const remaining = entry.expireAt - Date.now();
+      if (remaining <= 0) {
+        this._deleteInternal(key);
+        return undefined;
+      }
+      return remaining;
+    }
+
+    return null;
+  }
+
+  getRemainingTtlMany(keys: string[]): Record<string, CacheRemainingTtl> {
+    if (keys.length === 0) {
+      return {};
+    }
+
+    const result: Record<string, CacheRemainingTtl> = {};
+    for (const key of keys) {
+      const ttl = this.getRemainingTtl(key);
+      if (ttl !== undefined) {
+        result[key] = ttl;
+      }
+    }
+    return result;
+  }
 
   invalidateByTag(tag: string): void {
     if (!this._options.enableTags) {

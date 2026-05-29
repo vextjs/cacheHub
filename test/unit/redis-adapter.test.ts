@@ -17,12 +17,14 @@ vi.mock("module", async (importOriginal) => {
     set = vi.fn().mockResolvedValue("OK");
     del = vi.fn().mockResolvedValue(1);
     exists = vi.fn().mockResolvedValue(0);
+    pttl = vi.fn().mockResolvedValue(-2);
     flushdb = vi.fn().mockResolvedValue("OK");
     mget = vi.fn().mockResolvedValue([]);
     scan = vi.fn().mockResolvedValue(["0", []]);
     pipeline = vi.fn().mockReturnValue({
       set: vi.fn().mockReturnThis(),
       del: vi.fn().mockReturnThis(),
+      pttl: vi.fn().mockReturnThis(),
       exec: vi.fn().mockResolvedValue([]),
     });
     quit = vi.fn().mockResolvedValue("OK");
@@ -53,6 +55,7 @@ function makeMockRedis() {
   const pipelineMock = {
     set: vi.fn().mockReturnThis(),
     del: vi.fn().mockReturnThis(),
+    pttl: vi.fn().mockReturnThis(),
     exec: vi.fn().mockResolvedValue([]),
   };
 
@@ -61,6 +64,7 @@ function makeMockRedis() {
     set: vi.fn().mockResolvedValue("OK"),
     del: vi.fn().mockResolvedValue(0),
     exists: vi.fn().mockResolvedValue(0),
+    pttl: vi.fn().mockResolvedValue(-2),
     flushdb: vi.fn().mockResolvedValue("OK"),
     mget: vi.fn().mockResolvedValue([]),
     pipeline: vi.fn().mockReturnValue(pipelineMock),
@@ -314,6 +318,11 @@ describe("RedisCacheAdapter", () => {
       const result = await adapter.getMany(["k"]);
       expect(result["k"]).toBe("not-json{");
     });
+
+    it("非法空 key 时抛出 TypeError（批量路径统一校验）", async () => {
+      const { adapter } = makeAdapter();
+      await expect(adapter.getMany([""])).rejects.toThrow(TypeError);
+    });
   });
 
   // ────────────────────────────────────────────────────────
@@ -354,6 +363,11 @@ describe("RedisCacheAdapter", () => {
       const { adapter } = makeAdapter();
       expect(await adapter.setMany({ k: "v" })).toBe(true);
     });
+
+    it("非法空 key 时抛出 TypeError（批量路径统一校验）", async () => {
+      const { adapter } = makeAdapter();
+      await expect(adapter.setMany({ "": "v" })).rejects.toThrow(TypeError);
+    });
   });
 
   // ────────────────────────────────────────────────────────
@@ -375,6 +389,11 @@ describe("RedisCacheAdapter", () => {
       const result = await adapter.delMany(["k1", "k2", "k3"]);
       expect(result).toBe(2);
       expect(redis.del).toHaveBeenCalledWith("k1", "k2", "k3");
+    });
+
+    it("非法空 key 时抛出 TypeError（批量路径统一校验）", async () => {
+      const { adapter } = makeAdapter();
+      await expect(adapter.delMany([""])).rejects.toThrow(TypeError);
     });
   });
 
@@ -517,6 +536,73 @@ describe("RedisCacheAdapter", () => {
       const { adapter, redis } = makeAdapter();
       redis.scan.mockResolvedValue(["0", []]);
       expect(await adapter.keys("nonexistent:*")).toEqual([]);
+    });
+  });
+
+  describe("getRemainingTtl", () => {
+    it("存在过期时间时返回剩余 TTL（毫秒）", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.pttl.mockResolvedValue(1234);
+
+      expect(await adapter.getRemainingTtl!("k")).toBe(1234);
+      expect(redis.pttl).toHaveBeenCalledWith("k");
+    });
+
+    it("永不过期时返回 null", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.pttl.mockResolvedValue(-1);
+
+      expect(await adapter.getRemainingTtl!("k")).toBeNull();
+    });
+
+    it("键不存在时返回 undefined", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.pttl.mockResolvedValue(-2);
+
+      expect(await adapter.getRemainingTtl!("missing")).toBeUndefined();
+    });
+
+    it("Redis 返回 0 或负异常 TTL 时按不存在处理", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.pttl.mockResolvedValue(0);
+
+      expect(await adapter.getRemainingTtl!("race-key")).toBeUndefined();
+    });
+
+    it("非法空 key 时抛出 TypeError", async () => {
+      const { adapter } = makeAdapter();
+      await expect(adapter.getRemainingTtl!("")).rejects.toThrow(TypeError);
+    });
+
+    it("批量 TTL 查询空输入快速返回空对象", async () => {
+      const { adapter, redis } = makeAdapter();
+
+      expect(await adapter.getRemainingTtlMany!([])).toEqual({});
+      expect(redis.pipeline).not.toHaveBeenCalled();
+    });
+
+    it("批量 TTL 查询仅返回存在且可判定语义的键", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis._pipeline.exec.mockResolvedValue([
+        [null, 3000],
+        [null, -1],
+        [null, -2],
+      ]);
+
+      expect(await adapter.getRemainingTtlMany!(["k1", "k2", "k3"])).toEqual({
+        k1: 3000,
+        k2: null,
+      });
+      expect(redis._pipeline.pttl).toHaveBeenCalledWith("k1");
+      expect(redis._pipeline.pttl).toHaveBeenCalledWith("k2");
+      expect(redis._pipeline.pttl).toHaveBeenCalledWith("k3");
+    });
+
+    it("批量 TTL 查询会校验非法 key", async () => {
+      const { adapter } = makeAdapter();
+      await expect(adapter.getRemainingTtlMany!([""])).rejects.toThrow(
+        TypeError,
+      );
     });
   });
 

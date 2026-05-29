@@ -514,6 +514,45 @@ describe("withCache", () => {
       expect(calls).toBe(6);
     });
 
+    it("默认键构造路径精确删除仍存在的已写入键，并清理淘汰历史键", async () => {
+      const cache = makeCache({ maxEntries: 1 });
+      const delPatternSpy = vi.spyOn(cache, "delPattern");
+      const delSpy = vi.spyOn(cache, "del");
+      const cached = withCache(async (id: number) => `v${id}`, {
+        cache,
+        ttl: 1000,
+        namespace: "demo",
+      });
+
+      await cached(1);
+      await cached(2);
+      await cached(3);
+
+      expect(cache.keys()).toHaveLength(1);
+
+      await cached.invalidateAll();
+
+      expect(delPatternSpy).not.toHaveBeenCalled();
+      expect(delSpy).toHaveBeenCalledTimes(1);
+      expect(cache.keys()).toEqual([]);
+    });
+
+    it("invalidateAll 不删除同前缀但非该包装函数写入的键", async () => {
+      const cache = makeCache();
+      cache.set("demo:anonymous:manual", "manual", 1000);
+      const cached = withCache(async (id: number) => `v${id}`, {
+        cache,
+        ttl: 1000,
+        namespace: "demo",
+      });
+
+      await cached(1);
+      await cached.invalidateAll();
+
+      expect(cache.get("demo:anonymous:manual")).toBe("manual");
+      expect(cache.keys()).toEqual(["demo:anonymous:manual"]);
+    });
+
     it("invalidateAll 后 knownKeys 清空，再次 invalidateAll 不报错", async () => {
       const fn = async () => "v";
       const cached = withCache(fn, { ttl: 1000 });
@@ -539,6 +578,21 @@ describe("withCache", () => {
 
       // 不应向外抛出
       await expect(cached.invalidateAll()).resolves.toBeUndefined();
+    });
+
+    it("invalidateAll 清理 knownKeys 时 exists 抛错仍保留并尝试删除", async () => {
+      const cache = makeCache();
+      const cached = withCache(async () => "v", { cache, ttl: 1000 });
+      await cached();
+
+      vi.spyOn(cache, "exists").mockImplementation(() => {
+        throw new Error("exists failed");
+      });
+      const delSpy = vi.spyOn(cache, "del");
+
+      await cached.invalidateAll();
+
+      expect(delSpy).toHaveBeenCalledTimes(1);
     });
   });
 

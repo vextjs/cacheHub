@@ -3,7 +3,7 @@
  * 基于 Redis Pub/Sub 实现跨实例的缓存失效通知
  *
  * 工作原理：
- * 1. 调用 invalidate(pattern) 时，通过 pub 连接向频道广播失效消息
+ * 1. 调用 invalidate(pattern) 时，先失效当前实例本地缓存，再通过 pub 连接广播失效消息
  * 2. 所有订阅同一频道的实例均会收到该消息
  * 3. instanceId 过滤：忽略自身发出的消息，避免本地重复失效
  * 4. 其他实例收到消息后，调用 cache.delPattern(pattern) 失效本地缓存
@@ -79,7 +79,7 @@ export interface InvalidatorStats {
   messagesSent: number;
   /** 从频道接收到的消息总数（含自身消息，instanceId 过滤前） */
   messagesReceived: number;
-  /** 实际触发 delPattern 的次数（过滤自身消息后） */
+  /** 实际触发 delPattern 的次数（含本地主动失效与接收其他实例消息） */
   invalidationsTriggered: number;
   /** 错误次数（发布 / 订阅 / 消息解析 / 失效处理） */
   errors: number;
@@ -171,7 +171,7 @@ function _buildConnections(
  *     cache: multiLevelCacheInstance,
  * });
  *
- * // 广播失效：所有其他实例执行 cache.delPattern('user:*')
+ * // 本地先失效，再广播给其他实例执行 cache.delPattern('user:*')
  * await invalidator.invalidate('user:*');
  *
  * // 关闭连接
@@ -291,8 +291,8 @@ export class DistributedCacheInvalidator {
         typeof msg.pattern === "string" &&
         msg.pattern.length > 0
       ) {
-        // 异步处理，不阻塞 Redis 消息循环；错误在 _handleInvalidation 内捕获
-        void this._handleInvalidation(msg.pattern);
+        // 异步处理，不阻塞 Redis 消息循环；错误在 _invalidateLocal 内捕获
+        void this._invalidateLocal(msg.pattern);
       }
     });
   }
@@ -302,7 +302,10 @@ export class DistributedCacheInvalidator {
    * delPattern 返回 number | Promise<number>，统一 await。
    * @private
    */
-  private async _handleInvalidation(pattern: string): Promise<void> {
+  private async _invalidateLocal(
+    pattern: string,
+    rethrowErrors = false,
+  ): Promise<void> {
     try {
       await this._cache.delPattern(pattern);
       this._stats.invalidationsTriggered++;
@@ -314,14 +317,17 @@ export class DistributedCacheInvalidator {
       this._logger?.error?.(
         `[cache-hub/distributed] invalidation error: ${(err as Error).message}`,
       );
+      if (rethrowErrors) {
+        throw err;
+      }
     }
   }
 
   /**
    * 广播缓存失效消息。
    *
-   * 同频道内的其他实例收到消息后将调用 cache.delPattern(pattern)。
-   * 本实例自身不会因此触发 delPattern（instanceId 过滤）。
+   * 当前实例会先执行本地失效，再广播给同频道内的其他实例。
+   * 订阅回环中的自身消息仍会被 instanceId 过滤，避免重复失效。
    *
    * @param pattern - 缓存键模式（支持通配符 *；空字符串不发送）
    * @throws 发布失败时抛出 ioredis 错误
@@ -330,6 +336,8 @@ export class DistributedCacheInvalidator {
     if (!pattern) {
       return;
     }
+
+    await this._invalidateLocal(pattern, true);
 
     const msg: InvalidationMessage = {
       type: "invalidate",

@@ -499,6 +499,31 @@ describeIfRedis("Redis 集成测试", () => {
       expect(result[`${TEST_PREFIX}mlc:many:1`]).toEqual({ id: 1 });
       expect(result[`${TEST_PREFIX}mlc:many:2`]).toEqual({ id: 2 });
     });
+
+    it("L2 回填 L1 时保留远端 TTL，不把短 TTL 扩展为本地永久缓存", async () => {
+      if (!redisAvailable) return;
+
+      const key = `${TEST_PREFIX}mlc:backfill-ttl`;
+      const local = new MemoryCache({ maxEntries: 100, defaultTtl: 0 });
+      const remote = createRedisCacheAdapter(REDIS_URL);
+      const cache = new MultiLevelCache({ local, remote });
+
+      try {
+        await remote.set(key, { shortLived: true }, 60);
+        expect(local.get(key)).toBeUndefined();
+
+        expect(await cache.get(key)).toEqual({ shortLived: true });
+        expect(local.get(key)).toEqual({ shortLived: true });
+
+        await new Promise((r) => setTimeout(r, 120));
+
+        expect(local.get(key)).toBeUndefined();
+        expect(await cache.get(key)).toBeUndefined();
+      } finally {
+        await remote.del(key);
+        await remote.close();
+      }
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────
@@ -572,7 +597,7 @@ describeIfRedis("Redis 集成测试", () => {
       }
     });
 
-    it("自身消息不触发本地 delPattern（instanceId 过滤）", async () => {
+    it("调用 invalidate() 时当前实例先失效，本身回环消息不会重复触发", async () => {
       if (!redisAvailable) return;
 
       const l1 = new MemoryCache({ maxEntries: 100 });
@@ -598,13 +623,13 @@ describeIfRedis("Redis 集成测试", () => {
         // 等待消息处理
         await new Promise((r) => setTimeout(r, 400));
 
-        // 自身消息被过滤，L1 不应被清空
-        expect(l1.get("product:1")).toBeDefined();
+        // invalidate() 已先失效本地缓存；回环消息仍会被 instanceId 过滤，避免重复触发
+        expect(l1.get("product:1")).toBeUndefined();
 
         const stats = invalidator.getStats();
         expect(stats.messagesSent).toBe(1);
         expect(stats.messagesReceived).toBeGreaterThanOrEqual(1);
-        expect(stats.invalidationsTriggered).toBe(0);
+        expect(stats.invalidationsTriggered).toBe(1);
       } finally {
         await invalidator.close();
       }

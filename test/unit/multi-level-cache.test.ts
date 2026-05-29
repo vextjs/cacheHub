@@ -17,12 +17,34 @@ function makeRemote(): CacheLike & {
   delay: number;
 } {
   const store: Record<string, any> = {};
+  const expireAtByKey: Record<string, number | null> = {};
   let delay = 0;
 
   const wait = () =>
     delay > 0
       ? new Promise<void>((r) => setTimeout(r, delay))
       : Promise.resolve();
+
+  const purgeExpiredKey = (key: string) => {
+    const expireAt = expireAtByKey[key];
+    if (expireAt !== undefined && expireAt !== null && expireAt <= Date.now()) {
+      delete store[key];
+      delete expireAtByKey[key];
+    }
+  };
+
+  const resolveRemainingTtl = (key: string) => {
+    purgeExpiredKey(key);
+    if (!(key in store)) {
+      return undefined;
+    }
+    const expireAt = expireAtByKey[key];
+    if (expireAt === undefined || expireAt === null) {
+      return null;
+    }
+    const remaining = expireAt - Date.now();
+    return remaining > 0 ? remaining : undefined;
+  };
 
   return {
     store,
@@ -35,51 +57,66 @@ function makeRemote(): CacheLike & {
 
     async get(key: string) {
       await wait();
+      purgeExpiredKey(key);
       return store[key];
     },
-    async set(key: string, value: any) {
+    async set(key: string, value: any, ttl?: number) {
       await wait();
       store[key] = value;
+      expireAtByKey[key] =
+        ttl !== undefined && ttl > 0 ? Date.now() + ttl : null;
     },
     async del(key: string) {
       await wait();
+      purgeExpiredKey(key);
       const existed = key in store;
       delete store[key];
+      delete expireAtByKey[key];
       return existed;
     },
     async exists(key: string) {
       await wait();
+      purgeExpiredKey(key);
       return key in store;
     },
     async has(key: string) {
       await wait();
+      purgeExpiredKey(key);
       return key in store;
     },
     async clear() {
       await wait();
       for (const k of Object.keys(store)) {
         delete store[k];
+        delete expireAtByKey[k];
       }
     },
     async getMany(keys: string[]) {
       await wait();
       const result: Record<string, any> = {};
       for (const k of keys) {
+        purgeExpiredKey(k);
         if (k in store) result[k] = store[k];
       }
       return result;
     },
-    async setMany(entries: Record<string, any>) {
+    async setMany(entries: Record<string, any>, ttl?: number) {
       await wait();
-      Object.assign(store, entries);
+      for (const [key, value] of Object.entries(entries)) {
+        store[key] = value;
+        expireAtByKey[key] =
+          ttl !== undefined && ttl > 0 ? Date.now() + ttl : null;
+      }
       return true;
     },
     async delMany(keys: string[]) {
       await wait();
       let count = 0;
       for (const k of keys) {
+        purgeExpiredKey(k);
         if (k in store) {
           delete store[k];
+          delete expireAtByKey[k];
           count++;
         }
       }
@@ -93,8 +130,10 @@ function makeRemote(): CacheLike & {
       const regex = new RegExp("^" + escaped + "$");
       let count = 0;
       for (const k of Object.keys(store)) {
+        purgeExpiredKey(k);
         if (regex.test(k)) {
           delete store[k];
+          delete expireAtByKey[k];
           count++;
         }
       }
@@ -102,14 +141,48 @@ function makeRemote(): CacheLike & {
     },
     async keys(pattern?: string) {
       await wait();
-      if (!pattern) return Object.keys(store);
+      if (!pattern) {
+        return Object.keys(store).filter((k) => {
+          purgeExpiredKey(k);
+          return k in store;
+        });
+      }
       const escaped = pattern
         .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
         .replace(/\\\*/g, ".*");
       const regex = new RegExp("^" + escaped + "$");
-      return Object.keys(store).filter((k) => regex.test(k));
+      return Object.keys(store).filter((k) => {
+        purgeExpiredKey(k);
+        return regex.test(k);
+      });
+    },
+    async getRemainingTtl(key: string) {
+      await wait();
+      return resolveRemainingTtl(key);
+    },
+    async getRemainingTtlMany(keys: string[]) {
+      await wait();
+      const result: Record<string, number | null> = {};
+      for (const key of keys) {
+        const ttl = resolveRemainingTtl(key);
+        if (ttl !== undefined) {
+          result[key] = ttl;
+        }
+      }
+      return result;
     },
   };
+}
+
+function withoutTtlSupport<T extends ReturnType<typeof makeRemote>>(
+  remote: T,
+): CacheLike & { store: T["store"]; delay: number } {
+  const {
+    getRemainingTtl: _getRemainingTtl,
+    getRemainingTtlMany: _getRemainingTtlMany,
+    ...base
+  } = remote;
+  return base;
 }
 
 function makeCache(
@@ -247,6 +320,58 @@ describe("MultiLevelCache", () => {
 
       const result = await mlc.get("k");
       expect(result).toBe("v");
+    });
+
+    it("L2 命中回填时保留远端剩余 TTL，避免把短 TTL 扩展为永久缓存", async () => {
+      const local = makeLocal({ defaultTtl: 0 });
+      const remote = makeRemote();
+      await remote.set("k", "v", 20);
+      const mlc = new MultiLevelCache({ local, remote });
+
+      expect(await mlc.get("k")).toBe("v");
+      expect(local.get("k")).toBe("v");
+
+      await new Promise((r) => setTimeout(r, 40));
+
+      expect(local.get("k")).toBeUndefined();
+      expect(await mlc.get("k")).toBeUndefined();
+    });
+
+    it("远端不支持 TTL 查询时仍按旧语义回填 L1", async () => {
+      const local = makeLocal({ defaultTtl: 20 });
+      const remote = withoutTtlSupport(makeRemote());
+      remote.store["k"] = "v";
+      const mlc = new MultiLevelCache({ local, remote });
+
+      expect(await mlc.get("k")).toBe("v");
+      expect(local.get("k")).toBe("v");
+
+      await new Promise((r) => setTimeout(r, 40));
+      expect(local.get("k")).toBeUndefined();
+    });
+
+    it("TTL 查询失败时回退到 unknown TTL 回填，不影响本次读取", async () => {
+      const local = makeLocal({ defaultTtl: 20 });
+      const remote = makeRemote();
+      remote.store["k"] = "v";
+      vi.spyOn(remote, "getRemainingTtl").mockRejectedValue(
+        new Error("pttl failed"),
+      );
+      const mlc = new MultiLevelCache({ local, remote });
+
+      expect(await mlc.get("k")).toBe("v");
+      expect(local.get("k")).toBe("v");
+    });
+
+    it("TTL 查询确认键已不存在时跳过回填但仍返回本次 L2 值", async () => {
+      const local = makeLocal();
+      const remote = makeRemote();
+      remote.store["k"] = "v";
+      vi.spyOn(remote, "getRemainingTtl").mockResolvedValue(undefined);
+      const mlc = new MultiLevelCache({ local, remote });
+
+      expect(await mlc.get("k")).toBe("v");
+      expect(local.get("k")).toBeUndefined();
     });
   });
 
@@ -530,15 +655,76 @@ describe("MultiLevelCache", () => {
         expect(result).toEqual({ k1: "v1" });
       }, 500);
 
-      it("L2 命中回填 L1 时 setMany 失败静默忽略，仍返回结果", async () => {
+      it("L2 命中回填 L1 时 set 失败静默忽略，仍返回结果", async () => {
         const local = makeLocal();
         const remote = makeRemote();
         remote.store["k1"] = "v1";
-        vi.spyOn(local, "setMany").mockRejectedValue(new Error("setMany fail"));
+        vi.spyOn(local, "set").mockRejectedValue(new Error("set fail"));
         const mlc = new MultiLevelCache({ local, remote });
 
         const result = await mlc.getMany(["k1"]);
         expect(result).toEqual({ k1: "v1" });
+      });
+
+      it("L2 批量命中回填时保留远端剩余 TTL", async () => {
+        const local = makeLocal({ defaultTtl: 0 });
+        const remote = makeRemote();
+        await remote.setMany({ k1: "v1", k2: "v2" }, 20);
+        const mlc = new MultiLevelCache({ local, remote });
+
+        expect(await mlc.getMany(["k1", "k2"])).toEqual({ k1: "v1", k2: "v2" });
+        expect(local.get("k1")).toBe("v1");
+        expect(local.get("k2")).toBe("v2");
+
+        await new Promise((r) => setTimeout(r, 40));
+
+        expect(local.get("k1")).toBeUndefined();
+        expect(local.get("k2")).toBeUndefined();
+      });
+
+      it("L2 批量命中且远端不支持 TTL 查询时仍回填 L1", async () => {
+        const local = makeLocal({ defaultTtl: 20 });
+        const remote = withoutTtlSupport(makeRemote());
+        await remote.setMany({ k1: "v1", k2: "v2" });
+        const mlc = new MultiLevelCache({ local, remote });
+
+        expect(await mlc.getMany(["k1", "k2"])).toEqual({
+          k1: "v1",
+          k2: "v2",
+        });
+        expect(local.get("k1")).toBe("v1");
+        expect(local.get("k2")).toBe("v2");
+      });
+
+      it("批量 TTL 查询失败时回退到逐键 TTL 查询", async () => {
+        const local = makeLocal({ defaultTtl: 0 });
+        const remote = makeRemote();
+        await remote.set("k1", "v1", 20);
+        await remote.set("k2", "v2", 20);
+        vi.spyOn(remote, "getRemainingTtlMany").mockRejectedValue(
+          new Error("batch pttl failed"),
+        );
+        const mlc = new MultiLevelCache({ local, remote });
+
+        expect(await mlc.getMany(["k1", "k2"])).toEqual({
+          k1: "v1",
+          k2: "v2",
+        });
+        expect(local.get("k1")).toBe("v1");
+        expect(local.get("k2")).toBe("v2");
+
+        await new Promise((r) => setTimeout(r, 40));
+        expect(local.get("k1")).toBeUndefined();
+        expect(local.get("k2")).toBeUndefined();
+      });
+
+      it("内部批量 TTL 解析对空输入返回空对象", async () => {
+        const local = makeLocal();
+        const mlc = new MultiLevelCache({ local });
+
+        await expect((mlc as any)._resolveBackfillTtls([])).resolves.toEqual(
+          {},
+        );
       });
     });
 

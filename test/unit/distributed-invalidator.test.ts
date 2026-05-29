@@ -267,6 +267,32 @@ describe("DistributedCacheInvalidator — 构造函数", () => {
 // ──────────────────────────────────────────────
 
 describe("DistributedCacheInvalidator — invalidate()", () => {
+  it("先失效本地缓存，再执行 publish", async () => {
+    const pub = makeRedisMock();
+    const cache = makeCacheMock();
+    const order: string[] = [];
+
+    (cache.delPattern as any).mockImplementation(async () => {
+      order.push("local");
+      return 1;
+    });
+    pub.publish.mockImplementation(async () => {
+      order.push("publish");
+      return 1;
+    });
+
+    const { invalidator } = makeInvalidator({ cache }, pub);
+    await invalidator.invalidate("user:*");
+
+    expect(order).toEqual(["local", "publish"]);
+  });
+
+  it("主动失效成功后 invalidationsTriggered +1", async () => {
+    const { invalidator } = makeInvalidator();
+    await invalidator.invalidate("user:*");
+    expect(invalidator.getStats().invalidationsTriggered).toBe(1);
+  });
+
   it("调用 pub.publish，消息包含正确字段", async () => {
     const { invalidator, pub } = makeInvalidator({
       instanceId: "sender",
@@ -307,6 +333,20 @@ describe("DistributedCacheInvalidator — invalidate()", () => {
     await invalidator.invalidate("");
     expect(pub.publish).not.toHaveBeenCalled();
     expect(invalidator.getStats().messagesSent).toBe(0);
+  });
+
+  it("本地失效失败时不调用 publish，并向外抛出错误", async () => {
+    const pub = makeRedisMock();
+    const cache = makeCacheMock();
+    (cache.delPattern as any).mockRejectedValue(new Error("local invalidate failed"));
+    const { invalidator } = makeInvalidator({ cache }, pub);
+
+    await expect(invalidator.invalidate("user:*")).rejects.toThrow(
+      "local invalidate failed",
+    );
+    expect(pub.publish).not.toHaveBeenCalled();
+    expect(invalidator.getStats().errors).toBe(1);
+    expect(invalidator.getStats().invalidationsTriggered).toBe(0);
   });
 
   it("publish 失败时向外抛出错误", async () => {

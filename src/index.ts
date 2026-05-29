@@ -8,6 +8,7 @@
 // 核心类型
 export type {
   CacheLike,
+  CacheRemainingTtl,
   CacheStats,
   MemoryCacheOptions,
   LockManager,

@@ -472,6 +472,57 @@ describe("MemoryCache", () => {
   });
 
   // ────────────────────────────────────────────────────────
+  // 可选 TTL 查询扩展
+  // ────────────────────────────────────────────────────────
+
+  describe("TTL 查询扩展", () => {
+    it("getRemainingTtl 对带过期时间的键返回正数", () => {
+      cache.set("ttl-key", "v", 1000);
+      const ttl = cache.getRemainingTtl!("ttl-key");
+      expect(typeof ttl).toBe("number");
+      expect(ttl as number).toBeGreaterThan(0);
+    });
+
+    it("getRemainingTtl 对永不过期键返回 null", () => {
+      cache.set("forever", "v", 0);
+      expect(cache.getRemainingTtl!("forever")).toBeNull();
+    });
+
+    it("getRemainingTtl 对不存在键返回 undefined", () => {
+      expect(cache.getRemainingTtl!("missing")).toBeUndefined();
+    });
+
+    it("getRemainingTtl 会惰性清理已过期键", async () => {
+      cache.set("expired", "v", 10);
+      await sleep(30);
+      expect(cache.getRemainingTtl!("expired")).toBeUndefined();
+      expect(cache.exists("expired")).toBe(false);
+    });
+
+    it("enabled=false 时 getRemainingTtl 返回 undefined", () => {
+      const c = makeCache({ enabled: false });
+      c.set("disabled", "v", 1000);
+      expect(c.getRemainingTtl!("disabled")).toBeUndefined();
+      c.destroy();
+    });
+
+    it("getRemainingTtlMany 返回存在键的 TTL 语义", () => {
+      cache.set("ttl", "v", 1000);
+      cache.set("forever", "v", 0);
+
+      const result = cache.getRemainingTtlMany!(["ttl", "forever", "missing"]);
+
+      expect(result["ttl"]).toEqual(expect.any(Number));
+      expect(result["forever"]).toBeNull();
+      expect(result["missing"]).toBeUndefined();
+    });
+
+    it("getRemainingTtlMany 空输入返回空对象", () => {
+      expect(cache.getRemainingTtlMany!([])).toEqual({});
+    });
+  });
+
+  // ────────────────────────────────────────────────────────
   // 标签索引（enableTags）
   // ────────────────────────────────────────────────────────
 

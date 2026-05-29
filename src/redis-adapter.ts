@@ -41,7 +41,7 @@ function loadIoredis(): any {
 
 // ── 接口扩展 ──
 
-import type { CacheLike, CacheStats } from './types.js';
+import type { CacheLike, CacheRemainingTtl, CacheStats } from './types.js';
 
 /**
  * Redis 适配器扩展方法（close + getRedisInstance）
@@ -83,6 +83,25 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
                 `[cache-hub] key 必须为非空字符串，收到: ${JSON.stringify(key)}`
             );
         }
+    }
+
+    private _validateKeys(keys: string[]): void {
+        for (const key of keys) {
+            this._validateKey(key);
+        }
+    }
+
+    private _normalizeRemainingTtl(ttl: number): CacheRemainingTtl | undefined {
+        if (ttl === -2) {
+            return undefined;
+        }
+        if (ttl === -1) {
+            return null;
+        }
+        if (ttl <= 0) {
+            return undefined;
+        }
+        return ttl;
     }
 
     /**
@@ -157,6 +176,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         if (keys.length === 0) {
             return {};
         }
+        this._validateKeys(keys);
 
         const values: (string | null)[] = await this._redis.mget(...keys);
         const result: Record<string, any> = {};
@@ -179,6 +199,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         if (keys.length === 0) {
             return true;
         }
+        this._validateKeys(keys);
 
         const pipeline = this._redis.pipeline();
         for (const key of keys) {
@@ -198,6 +219,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         if (keys.length === 0) {
             return 0;
         }
+        this._validateKeys(keys);
         const result: number = await this._redis.del(...keys);
         return result;
     }
@@ -251,6 +273,36 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
             result.push(...matchedKeys);
         } while (cursor !== '0');
 
+        return result;
+    }
+
+    async getRemainingTtl(key: string): Promise<CacheRemainingTtl | undefined> {
+        this._validateKey(key);
+        const ttl: number = await this._redis.pttl(key);
+        return this._normalizeRemainingTtl(ttl);
+    }
+
+    async getRemainingTtlMany(
+        keys: string[],
+    ): Promise<Record<string, CacheRemainingTtl>> {
+        if (keys.length === 0) {
+            return {};
+        }
+        this._validateKeys(keys);
+
+        const pipeline = this._redis.pipeline();
+        for (const key of keys) {
+            pipeline.pttl(key);
+        }
+
+        const responses: Array<[Error | null, number]> = await pipeline.exec();
+        const result: Record<string, CacheRemainingTtl> = {};
+        for (let i = 0; i < keys.length; i++) {
+            const ttl = this._normalizeRemainingTtl(responses[i]?.[1] as number);
+            if (ttl !== undefined) {
+                result[keys[i]] = ttl;
+            }
+        }
         return result;
     }
 
