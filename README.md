@@ -166,6 +166,10 @@ import type { CacheLike, CacheStats, MemoryCacheOptions } from 'cache-hub';
 | `enableTags` | `boolean` | `false` | 开启标签索引，支持 `invalidateByTag` |
 | `enabled` | `boolean` | `true` | `false` 时禁用缓存 |
 
+#### `MemoryCache` 实例方法
+
+除完整 `CacheLike` 接口外，`MemoryCache` 还提供 `getRemainingTtl(key)` 与 `getRemainingTtlMany(keys)`，用于查询未过期键的剩余 TTL；不过期键返回 `null`，不存在或已过期键返回 `undefined`。
+
 #### `CacheLike` 接口
 
 所有缓存实现均满足此接口，可互相替换：
@@ -252,6 +256,14 @@ await adapter.close();
 ```
 
 > **需要安装 ioredis**：`npm install ioredis`
+
+`RedisCacheAdapter` 实现完整 `CacheLike` 接口，并额外提供：
+
+| 方法 | 说明 |
+|------|------|
+| `getRemainingTtl(key)` | 查询 Redis 键的剩余 TTL；不过期键返回 `null`，不存在键返回 `undefined` |
+| `getRemainingTtlMany(keys)` | 批量查询剩余 TTL，返回 key 到 TTL 的映射 |
+| `close()` | 关闭适配器自己创建的连接；传入外部 ioredis 实例时不会关闭 |
 
 ---
 
@@ -355,7 +367,7 @@ npm test
 # 单元测试 + 覆盖率报告
 npm run test:coverage
 
-# 集成测试（30 个，需要本地 Redis）
+# 集成测试（需要本地 Redis）
 npm run test:integration
 
 # 指定 Redis 地址

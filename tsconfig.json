@@ -10,7 +10,7 @@
     "rootDir": "src",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "sourceMap": true,
+    "sourceMap": false,
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"],
