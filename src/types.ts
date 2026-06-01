@@ -92,3 +92,47 @@ export interface MemoryCacheOptions {
 export interface LockManager {
     isLocked(key: string): boolean;
 }
+
+/**
+ * 固定窗口限流计数结果。
+ */
+export interface FixedWindowRateLimitResult {
+    key: string;
+    hits: number;
+    limit: number;
+    remaining: number;
+    resetTime: Date;
+    retryAfterMs: number;
+}
+
+/**
+ * 固定窗口限流存储原语。
+ *
+ * 该接口是可选扩展，不属于 CacheLike 必需契约。
+ */
+export interface FixedWindowRateLimitStore {
+    increment(
+        key: string,
+        windowMs: number,
+        limit: number,
+        delta?: number
+    ): FixedWindowRateLimitResult | Promise<FixedWindowRateLimitResult>;
+    decrement(key: string, delta?: number): number | Promise<number>;
+    reset(key: string): boolean | Promise<boolean>;
+    resetPrefix(prefix: string): number | Promise<number>;
+}
+
+/**
+ * Redis 固定窗口原语所需的最小客户端能力。
+ */
+export interface RedisFixedWindowRateLimitClient {
+    eval(script: string, keyCount: number, ...args: Array<string | number>): Promise<unknown>;
+    del(...keys: string[]): Promise<number>;
+    scan(
+        cursor: string,
+        matchKeyword: 'MATCH',
+        pattern: string,
+        countKeyword: 'COUNT',
+        count: number
+    ): Promise<[string, string[]]>;
+}

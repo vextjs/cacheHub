@@ -36,13 +36,44 @@ function buildCacheKey(
   fnName: string,
   args: unknown[],
 ): string {
-  const raw = `${namespace}:${fnName}:${stableStringify(args)}`;
+  const raw = `${namespace}:${fnName}:${stringifyArgs(args)}`;
   if (raw.length > KEY_MAX_LENGTH) {
     // A09：超长键使用 SHA-256 摘要，保留前缀以便调试识别
     const hash = createHash("sha256").update(raw).digest("hex");
     return `${namespace}:${fnName}:sha256:${hash}`;
   }
   return raw;
+}
+
+function stringifyArgs(args: unknown[]): string {
+  if (args.length === 0) {
+    return "[]";
+  }
+
+  if (args.length === 1) {
+    const single = stringifySingleArg(args[0]);
+    if (single !== undefined) {
+      return `[${single}]`;
+    }
+  }
+
+  return stableStringify(args);
+}
+
+function stringifySingleArg(value: unknown): string | undefined {
+  if (value === null) {
+    return "null";
+  }
+  if (value === undefined) {
+    return "undefined";
+  }
+  if (typeof value === "number") {
+    return Number.isNaN(value) ? '"__NaN__"' : JSON.stringify(value);
+  }
+  if (typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  return undefined;
 }
 
 // ── withCache 类型定义 ──

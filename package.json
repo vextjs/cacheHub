@@ -1,10 +1,33 @@
 {
   "name": "cache-hub",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "types": "./dist/types/index.d.ts",
-  "description": "零运行时依赖的 Node.js 多层缓存库，统一工作区所有项目的缓存基础设施",
+  "description": "Zero-runtime-dependency multi-level caching toolkit for Node.js services.",
+  "keywords": [
+    "cache",
+    "caching",
+    "nodejs",
+    "typescript",
+    "memory-cache",
+    "redis",
+    "multi-level-cache",
+    "lru",
+    "ttl",
+    "read-through",
+    "function-cache",
+    "distributed-cache",
+    "rate-limit",
+    "fixed-window",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/vextjs/cacheHub#readme",
+  "bugs": {
+    "url": "https://github.com/vextjs/cacheHub/issues"
+  },
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
@@ -40,15 +63,22 @@
       "types": "./dist/types/read-through.d.ts",
       "import": "./dist/esm/read-through.js",
       "require": "./dist/cjs/read-through.js"
+    },
+    "./rate-limit": {
+      "types": "./dist/types/rate-limit.d.ts",
+      "import": "./dist/esm/rate-limit.js",
+      "require": "./dist/cjs/rate-limit.js"
     }
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18.0.0"
   },
   "files": [
     "dist",
     "CHANGELOG.md",
-    "changelogs"
+    "changelogs",
+    "docs",
+    "scripts/benchmark.mjs"
   ],
   "publishConfig": {
     "access": "public"
@@ -68,6 +98,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@vitest/coverage-v8": "^3.0.0",
+    "ioredis": "^5.0.0",
     "rimraf": "^5.0.0",
     "typescript": "^5.4.0",
     "vitest": "^3.0.0"
@@ -81,6 +112,7 @@
     "build": "rimraf dist && npm run build:esm && npm run build:cjs && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
     "build:esm": "tsc -p tsconfig.json",
     "build:cjs": "node scripts/build-cjs.mjs",
+    "benchmark": "npm run build && node scripts/benchmark.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run build"
   }

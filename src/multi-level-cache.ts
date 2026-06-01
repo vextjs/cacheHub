@@ -44,15 +44,25 @@ type ResolvedBackfillTtl = number | typeof UNKNOWN_BACKFILL_TTL;
 // ── 辅助函数 ──
 
 /**
- * 创建超时 Promise（仅用于 get 路径的降级保护）
+ * 包装远端操作超时，并在操作完成后清理 timer，避免成功请求遗留短期定时器。
  */
-function createRemoteTimeout(ms: number): Promise<never> {
-  return new Promise((_, reject) =>
-    setTimeout(
+async function withRemoteTimeout<T>(operation: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
       () => reject(new Error(`[cache-hub] remote timeout after ${ms}ms`)),
       ms,
-    ),
-  );
+    );
+    timer.unref?.();
+  });
+
+  try {
+    return await Promise.race<T>([operation, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 // ── 主类 ──
@@ -168,10 +178,10 @@ export class MultiLevelCache implements CacheLike {
     // L2 查询（含 remoteTimeoutMs 超时降级，A06：remoteTimeoutMs 仅用于 get 路径）
     let l2Value: T | undefined;
     try {
-      l2Value = await Promise.race<T | undefined>([
-        this._remote.get<T>(key),
-        createRemoteTimeout(this._remoteTimeoutMs),
-      ]);
+      l2Value = await withRemoteTimeout(
+        Promise.resolve(this._remote.get<T>(key)),
+        this._remoteTimeoutMs,
+      );
     } catch {
       // 超时或远端异常：降级为 miss，不影响调用方
       return undefined;
@@ -250,10 +260,10 @@ export class MultiLevelCache implements CacheLike {
       return false;
     }
     try {
-      return await Promise.race<boolean>([
-        this._remote.exists(key),
-        createRemoteTimeout(this._remoteTimeoutMs),
-      ]);
+      return await withRemoteTimeout(
+        Promise.resolve(this._remote.exists(key)),
+        this._remoteTimeoutMs,
+      );
     } catch {
       return false;
     }
@@ -292,10 +302,10 @@ export class MultiLevelCache implements CacheLike {
     // L2 补充 miss 的键（含超时降级）
     let l2Result: Record<string, any> = {};
     try {
-      l2Result = await Promise.race<Record<string, any>>([
-        this._remote.getMany(missingKeys),
-        createRemoteTimeout(this._remoteTimeoutMs),
-      ]);
+      l2Result = await withRemoteTimeout(
+        Promise.resolve(this._remote.getMany(missingKeys)),
+        this._remoteTimeoutMs,
+      );
     } catch {
       // L2 超时或失败：仅返回 L1 结果
       return l1Result;

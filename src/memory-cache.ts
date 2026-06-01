@@ -121,7 +121,10 @@ export class MemoryCache implements CacheLike {
     if (!this._options.enabled) {
       return undefined;
     }
+    return this._getInternal<T>(key);
+  }
 
+  private _getInternal<T = any>(key: string, now?: number): T | undefined {
     const entry = this._store.get(key) as InternalEntry<T> | undefined;
     if (!entry) {
       this._recordMiss();
@@ -129,10 +132,13 @@ export class MemoryCache implements CacheLike {
     }
 
     // 惰性 TTL 过期检查
-    if (entry.expireAt !== null && Date.now() >= entry.expireAt) {
-      this._deleteInternal(key);
-      this._recordMiss();
-      return undefined;
+    if (entry.expireAt !== null) {
+      const currentTime = now ?? Date.now();
+      if (currentTime >= entry.expireAt) {
+        this._deleteInternal(key);
+        this._recordMiss();
+        return undefined;
+      }
     }
 
     // LRU 刷新：delete + set 将条目移到 Map 末尾（最近使用）
@@ -156,10 +162,20 @@ export class MemoryCache implements CacheLike {
     if (!this._options.enabled) {
       return;
     }
+    this._setInternal(key, value, ttl, options, undefined, true);
+  }
 
+  private _setInternal(
+    key: string,
+    value: any,
+    ttl: number | undefined,
+    options: SetOptions | undefined,
+    now: number | undefined,
+    enforceLimits: boolean,
+  ): boolean {
     // 分布式锁守卫：锁定键跳过写入（技术方案 §3.2）
     if (this._lockManager?.isLocked(key)) {
-      return;
+      return false;
     }
 
     // 删除旧条目（回退内存计数 + 标签索引）
@@ -184,7 +200,7 @@ export class MemoryCache implements CacheLike {
     const entry: InternalEntry = {
       value,
       size,
-      expireAt: resolvedTtl > 0 ? Date.now() + resolvedTtl : null,
+      expireAt: resolvedTtl > 0 ? (now ?? Date.now()) + resolvedTtl : null,
       tags:
         this._options.enableTags && options?.tags && options.tags.length > 0
           ? options.tags
@@ -207,7 +223,10 @@ export class MemoryCache implements CacheLike {
     }
 
     this._recordSet();
-    this._enforceLimits();
+    if (enforceLimits) {
+      this._enforceLimits();
+    }
+    return true;
   }
 
   del(key: string): boolean {
@@ -254,9 +273,15 @@ export class MemoryCache implements CacheLike {
     if (keys.length === 0) {
       return {}; // A16：空输入返回空对象
     }
+    for (const key of keys) {
+      this._validateKey(key);
+    }
+    if (!this._options.enabled) {
+      return {};
+    }
     const result: Record<string, any> = {};
     for (const key of keys) {
-      const value = this.get(key);
+      const value = this._getInternal(key);
       if (value !== undefined) {
         result[key] = value;
       }
@@ -265,12 +290,25 @@ export class MemoryCache implements CacheLike {
   }
 
   setMany(entries: Record<string, any>, ttl?: number): boolean {
-    if (Object.keys(entries).length === 0) {
+    const entryList = Object.entries(entries);
+    if (entryList.length === 0) {
       return true; // A16：空输入视为成功
     }
-    for (const [key, value] of Object.entries(entries)) {
-      this.set(key, value, ttl);
+    for (const [key] of entryList) {
+      this._validateKey(key);
     }
+    if (!this._options.enabled) {
+      return true;
+    }
+    const rawTtl = ttl !== undefined ? ttl : this._options.defaultTtl;
+    const now =
+      typeof rawTtl === "number" && !Number.isNaN(rawTtl) && rawTtl > 0
+        ? Date.now()
+        : undefined;
+    for (const [key, value] of entryList) {
+      this._setInternal(key, value, ttl, undefined, now, false);
+    }
+    this._enforceLimits();
     return true;
   }
 
@@ -280,7 +318,9 @@ export class MemoryCache implements CacheLike {
     }
     let count = 0;
     for (const key of keys) {
-      if (this.del(key)) {
+      this._validateKey(key);
+      if (this._deleteInternal(key)) {
+        this._recordDelete();
         count++;
       }
     }
@@ -333,6 +373,13 @@ export class MemoryCache implements CacheLike {
 
   getRemainingTtl(key: string): CacheRemainingTtl | undefined {
     this._validateKey(key);
+    return this._getRemainingTtlInternal(key, Date.now());
+  }
+
+  private _getRemainingTtlInternal(
+    key: string,
+    now: number,
+  ): CacheRemainingTtl | undefined {
     if (!this._options.enabled) {
       return undefined;
     }
@@ -343,7 +390,7 @@ export class MemoryCache implements CacheLike {
     }
 
     if (entry.expireAt !== null) {
-      const remaining = entry.expireAt - Date.now();
+      const remaining = entry.expireAt - now;
       if (remaining <= 0) {
         this._deleteInternal(key);
         return undefined;
@@ -360,8 +407,10 @@ export class MemoryCache implements CacheLike {
     }
 
     const result: Record<string, CacheRemainingTtl> = {};
+    const now = Date.now();
     for (const key of keys) {
-      const ttl = this.getRemainingTtl(key);
+      this._validateKey(key);
+      const ttl = this._getRemainingTtlInternal(key, now);
       if (ttl !== undefined) {
         result[key] = ttl;
       }

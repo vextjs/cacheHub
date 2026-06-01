@@ -165,6 +165,39 @@ describe("withCache", () => {
       const keys = cache.keys() as string[];
       expect(keys.some((k) => k.startsWith("myns:"))).toBe(true);
     });
+
+    it("默认键生成对 0 参数和单 primitive 参数走等价 fast path", async () => {
+      const cache = new MemoryCache();
+      const cachedNoArgs = withCache(async function noArgs() {
+        return "no-args";
+      }, { cache });
+      const cachedValue = withCache(async function valueFn(_value: unknown) {
+        return "value";
+      }, { cache });
+
+      await cachedNoArgs();
+      await cachedValue(null);
+      await cachedValue(undefined);
+      await cachedValue(Number.NaN);
+      await cachedValue(1);
+      await cachedValue("x");
+      await cachedValue(true);
+      await cachedValue({ a: 1 });
+
+      expect(cache.keys()).toEqual(
+        expect.arrayContaining([
+          "fn:noArgs:[]",
+          "fn:valueFn:[null]",
+          "fn:valueFn:[undefined]",
+          'fn:valueFn:["__NaN__"]',
+          "fn:valueFn:[1]",
+          'fn:valueFn:["x"]',
+          "fn:valueFn:[true]",
+          'fn:valueFn:[{"a":1}]',
+        ]),
+      );
+      cache.destroy();
+    });
   });
 
   // ────────────────────────────────────────────────────────

@@ -1,63 +1,91 @@
 # cache-hub
 
-零运行时依赖的 Node.js 多层缓存库。开箱即用的本地内存缓存（LRU + TTL）、可选 Redis 远端缓存、多级联动、函数装饰器与分布式失效广播——通过统一的 `CacheLike` 接口无侵入接入任何 Node.js 服务。
+Zero-runtime-dependency multi-level caching toolkit for Node.js services.
 
-[![Node.js](https://img.shields.io/badge/node-%3E%3D16-brightgreen)](https://nodejs.org)
+`cache-hub` provides an in-memory LRU + TTL cache, optional Redis integration,
+read-through caching, function-level caching, distributed invalidation, stable
+cache-key serialization, and fixed-window rate-limit primitives behind a small
+`CacheLike` contract.
+
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Coverage: 100%](https://img.shields.io/badge/coverage-100%25-brightgreen)](#测试)
+[![Coverage: 100%](https://img.shields.io/badge/coverage-100%25-brightgreen)](#testing)
+
+Chinese documentation: [docs/README.zh-CN.md](./docs/README.zh-CN.md)
 
 ---
 
-## 特性
+## Table of Contents
 
-- **零运行时依赖** — `dependencies` 永远为空，不会污染你的依赖树
-- **LRU + TTL 内存缓存** — 基于 ES6 `Map` 实现 O(1) 淘汰，支持双重容量限制（条目数 + 内存字节）
-- **多级缓存** — L1 本地 + L2 远端，自动回填、TTL 保真、超时降级、写策略可配
-- **Redis 适配器** — 将 ioredis 包装为 `CacheLike`，SCAN 替代 KEYS，无阻塞
-- **函数装饰器** — `withCache` 一行代码缓存任意异步函数，并发去重 + 条件缓存
-- **分布式失效** — Redis Pub/Sub 广播跨实例缓存清除
-- **稳定序列化** — `stableStringify` 生成确定性缓存键，处理循环引用与特殊类型
-- **CJS + ESM 双格式** — 支持 `require` 和 `import`，多入口按需导入
+- [Why cache-hub](#why-cache-hub)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Module Reference](#module-reference)
+- [Redis Defaults](#redis-defaults)
+- [Testing](#testing)
+- [Benchmarking](#benchmarking)
+- [Build](#build)
+- [Node.js Support](#nodejs-support)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
-## 安装
+## Why cache-hub
+
+- **Zero runtime dependencies** - `dependencies` stays empty; Redis is an optional peer dependency.
+- **Memory cache with LRU + TTL** - O(1) operations with entry-count and memory-size limits.
+- **Multi-level cache** - L1 memory plus optional L2 remote cache, TTL-preserving backfill, timeout fallback, and configurable write policy.
+- **Redis adapter** - wraps ioredis as `CacheLike`; uses SCAN instead of KEYS for production-safe pattern operations.
+- **Read-through caching** - cache miss fetch, write-back, and in-flight request de-duplication.
+- **Function cache** - cache any async function with `withCache` or the `FunctionCache` registry.
+- **Distributed invalidation** - Redis Pub/Sub broadcasts cache invalidation across service instances.
+- **Stable key serialization** - deterministic cache keys with sorted object keys, cycle handling, and special value sentinels.
+- **Rate-limit primitives** - optional fixed-window stores for memory and Redis-backed HTTP middleware implementations.
+- **Dual package format** - ESM and CommonJS builds with subpath exports.
+
+---
+
+## Installation
 
 ```bash
 npm install cache-hub
 ```
 
-### 可选：Redis 功能
-
-Redis 适配器和分布式失效需要 [ioredis](https://github.com/redis/ioredis)：
+Redis-backed features require ioredis:
 
 ```bash
 npm install ioredis
 ```
 
+`ioredis` is an optional peer dependency. Projects that only use memory caching
+do not need to install it.
+
 ---
 
-## 快速开始
+## Quick Start
 
-### 内存缓存
+### Memory Cache
 
 ```typescript
 import { MemoryCache } from 'cache-hub';
 
 const cache = new MemoryCache({
-    maxEntries: 1000,       // 最多 1000 条
-    defaultTtl: 60_000,     // 默认 TTL 60 秒
+    maxEntries: 1000,
+    defaultTtl: 60_000,
     enableStats: true,
 });
 
 await cache.set('user:1', { name: 'Alice' });
-const user = await cache.get('user:1');  // { name: 'Alice' }
+
+const user = await cache.get<{ name: string }>('user:1');
+console.log(user?.name); // Alice
 
 const stats = cache.getStats();
-console.log(stats.hitRate);  // 0~1 命中率
+console.log(stats.hitRate); // 0..1
 ```
 
-### 读穿缓存
+### Read-through Cache
 
 ```typescript
 import { MemoryCache } from 'cache-hub';
@@ -65,18 +93,20 @@ import { readThrough } from 'cache-hub/read-through';
 
 const cache = new MemoryCache({ defaultTtl: 30_000 });
 
-// 缓存命中直返，未命中执行 fetcher 并写缓存
-// 相同 key 的并发请求共享同一 Promise（并发去重）
 const user = await readThrough(cache, 30_000, 'user:1', async () => {
     return db.findUser(1);
 });
 ```
 
-### 函数装饰器
+`readThrough` returns cached values immediately on hit. On miss, it runs the
+fetcher, writes non-`undefined` results back to cache, and shares one in-flight
+promise for concurrent calls with the same key.
+
+### Function Cache
 
 ```typescript
-import { withCache } from 'cache-hub/function-cache';
 import { MemoryCache } from 'cache-hub';
+import { withCache } from 'cache-hub/function-cache';
 
 const cache = new MemoryCache({ maxEntries: 500 });
 
@@ -86,16 +116,17 @@ const getUser = withCache(
         cache,
         ttl: 60_000,
         namespace: 'users',
-        // 条件缓存：仅缓存非空结果
         condition: (result) => result !== null,
-    }
+    },
 );
 
-// 参数相同的并发调用只执行一次 db.findUser
 const user = await getUser(1);
 ```
 
-### 多级缓存（L1 本地 + L2 Redis）
+The default key builder uses `stableStringify`. Long keys are compressed with a
+SHA-256 digest after the configured key length threshold.
+
+### Multi-level Cache
 
 ```typescript
 import { MemoryCache } from 'cache-hub';
@@ -108,18 +139,20 @@ const remote = createRedisCacheAdapter('redis://localhost:6379');
 const cache = new MultiLevelCache({
     local,
     remote,
-    remoteTimeoutMs: 50,          // 远端超时降级，不影响可用性
-    backfillOnRemoteHit: true,    // L2 命中时回填 L1；可查询 TTL 时保留远端剩余 TTL
-    writePolicy: 'both',          // 同步双写
+    remoteTimeoutMs: 50,
+    backfillOnRemoteHit: true,
+    writePolicy: 'both',
 });
 
-await cache.set('product:42', data, 120_000);
-const product = await cache.get('product:42');  // 先查 L1，再查 L2
+await cache.set('product:42', { name: 'Keyboard' }, 120_000);
+
+const product = await cache.get<{ name: string }>('product:42');
+console.log(product?.name); // Keyboard
 
 await remote.close();
 ```
 
-### 分布式缓存失效
+### Distributed Invalidation
 
 ```typescript
 import { MemoryCache } from 'cache-hub';
@@ -127,27 +160,57 @@ import { DistributedCacheInvalidator } from 'cache-hub/distributed';
 
 const local = new MemoryCache({ maxEntries: 1000 });
 
-// 多个服务实例各自持有本地缓存，通过 Redis Pub/Sub 广播失效
 const invalidator = new DistributedCacheInvalidator({
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
     cache: local,
     channel: 'app:cache-invalidation',
 });
 
-// 当前实例会先失效本地缓存，再广播给其他实例执行 delPattern
 await invalidator.invalidate('user:*');
-
-// 应用退出时关闭连接
 await invalidator.close();
 ```
 
+Calling `invalidate(pattern)` first invalidates the current instance and then
+broadcasts the same pattern to other subscribers.
+
+### Fixed-window Rate-limit Store
+
+```typescript
+import { createMemoryFixedWindowRateLimitStore } from 'cache-hub/rate-limit';
+
+const store = createMemoryFixedWindowRateLimitStore();
+
+const result = store.increment('rl:user:42', 60_000, 100);
+
+if (result.remaining === 0) {
+    console.log(`Retry after ${result.retryAfterMs}ms`);
+}
+```
+
+Redis-backed rate-limit state uses Lua scripts for atomic increment/decrement:
+
+```typescript
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+import { createRedisFixedWindowRateLimitStore } from 'cache-hub/rate-limit';
+
+const redisCache = createRedisCacheAdapter('redis://localhost:6379');
+const store = createRedisFixedWindowRateLimitStore(redisCache);
+
+await store.increment('rl:user:1', 60_000, 100);
+await store.decrement('rl:user:1');
+await store.resetPrefix('rl:user:');
+
+await redisCache.close();
+```
+
+`cache-hub/rate-limit` is a low-level primitive for middleware authors. It does
+not impose a specific HTTP framework adapter.
+
 ---
 
-## 模块参考
+## Module Reference
 
-cache-hub 采用多入口按需导入，避免捆绑不需要的模块。
-
-### `cache-hub` — 核心
+### `cache-hub`
 
 ```typescript
 import { MemoryCache } from 'cache-hub';
@@ -156,23 +219,23 @@ import type { CacheLike, CacheStats, MemoryCacheOptions } from 'cache-hub';
 
 #### `new MemoryCache(options?)`
 
-| 选项 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `maxEntries` | `number` | `10000` | 最大条目数，超限 LRU 淘汰 |
-| `maxMemory` | `number` | `0` | 最大内存（字节估算），超限 LRU 淘汰；`0` 表示无内存限制 |
-| `defaultTtl` | `number` | `0`（不过期）| 默认 TTL（毫秒） |
-| `cleanupInterval` | `number` | `0`（不清理）| 周期清理间隔（毫秒） |
-| `enableStats` | `boolean` | `true` | 开启命中率统计 |
-| `enableTags` | `boolean` | `false` | 开启标签索引，支持 `invalidateByTag` |
-| `enabled` | `boolean` | `true` | `false` 时禁用缓存 |
+| Option | Type | Default | Description |
+|---|---:|---:|---|
+| `maxEntries` | `number` | `10000` | Maximum number of entries before LRU eviction. |
+| `maxMemory` | `number` | `0` | Estimated max memory in bytes. `0` disables the memory limit. |
+| `defaultTtl` | `number` | `0` | Default TTL in milliseconds. `0` means no expiration. |
+| `cleanupInterval` | `number` | `0` | Periodic expired-entry cleanup interval in milliseconds. |
+| `enableStats` | `boolean` | `true` | Enables hit/miss statistics. |
+| `enableTags` | `boolean` | `false` | Enables tag indexes and `invalidateByTag`. |
+| `enabled` | `boolean` | `true` | Disables cache reads/writes when set to `false`. |
 
-#### `MemoryCache` 实例方法
+`MemoryCache` also exposes `getRemainingTtl(key)` and
+`getRemainingTtlMany(keys)`. A non-expiring existing key returns `null`; a
+missing or expired key returns `undefined`.
 
-除完整 `CacheLike` 接口外，`MemoryCache` 还提供 `getRemainingTtl(key)` 与 `getRemainingTtlMany(keys)`，用于查询未过期键的剩余 TTL；不过期键返回 `null`，不存在或已过期键返回 `undefined`。
+#### `CacheLike`
 
-#### `CacheLike` 接口
-
-所有缓存实现均满足此接口，可互相替换：
+Every cache implementation can be used through this interface:
 
 ```typescript
 interface CacheLike {
@@ -180,14 +243,13 @@ interface CacheLike {
     set(key: string, value: any, ttl?: number): void | Promise<void>;
     del(key: string): boolean | Promise<boolean>;
     exists(key: string): boolean | Promise<boolean>;
-    has(key: string): boolean | Promise<boolean>;         // exists 的同步别名
+    has(key: string): boolean | Promise<boolean>;
     clear(): void | Promise<void>;
     keys(pattern?: string): string[] | Promise<string[]>;
     getMany(keys: string[]): Record<string, any> | Promise<Record<string, any>>;
     setMany(entries: Record<string, any>, ttl?: number): boolean | Promise<boolean>;
     delMany(keys: string[]): number | Promise<number>;
-    delPattern(pattern: string): number | Promise<number>;   // 支持 * 通配符
-    // 可选扩展
+    delPattern(pattern: string): number | Promise<number>;
     getRemainingTtl?(key: string): number | null | undefined | Promise<number | null | undefined>;
     getRemainingTtlMany?(keys: string[]): Record<string, number | null> | Promise<Record<string, number | null>>;
     invalidateByTag?(tag: string): void | Promise<void>;
@@ -198,9 +260,7 @@ interface CacheLike {
 }
 ```
 
----
-
-### `cache-hub/read-through` — 读穿缓存
+### `cache-hub/read-through`
 
 ```typescript
 import { readThrough } from 'cache-hub/read-through';
@@ -209,206 +269,235 @@ function readThrough<V>(
     cache: CacheLike,
     ttl: number,
     key: string,
-    fetcher: () => Promise<V>
-): Promise<V>
+    fetcher: () => Promise<V>,
+): Promise<V>;
 ```
 
-- `ttl ≤ 0`：直接执行 fetcher，不写缓存
-- `fetcher` 返回 `null`：写入缓存（有效空值）；返回 `undefined`：不写缓存
-- 内置并发去重（同 key 共享 Promise）+ 超时防泄漏（300s）
+- `ttl <= 0` runs the fetcher without writing to cache.
+- `null` is cached as a valid value.
+- `undefined` is treated as a miss signal and is not cached.
+- Same-key concurrent calls share one in-flight promise.
 
----
-
-### `cache-hub/multi-level` — 多级缓存
+### `cache-hub/multi-level`
 
 ```typescript
 import { MultiLevelCache } from 'cache-hub/multi-level';
 
-new MultiLevelCache(options: MultiLevelCacheOptions)
+new MultiLevelCache(options);
 ```
 
-| 选项 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `local` | `CacheLike` | 必填 | L1 本地缓存 |
-| `remote` | `CacheLike` | — | L2 远端缓存（可选，未传时作为单级本地缓存运行）|
-| `writePolicy` | `'both' \| 'local-first-async-remote'` | `'both'` | 写策略 |
-| `backfillOnRemoteHit` | `boolean` | `true` | L2 命中时回填 L1；远端支持 TTL 查询时保留剩余 TTL，不支持时使用 L1 的默认 TTL 策略 |
-| `remoteTimeoutMs` | `number` | `50` | 远端超时（毫秒），超时降级不报错 |
-| `publish` | `(msg: { type: string; pattern: string; ts: number }) => void` | — | `delPattern` 时触发的分布式失效广播回调 |
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `local` | `CacheLike` | required | L1 local cache. |
+| `remote` | `CacheLike` | `undefined` | Optional L2 remote cache. |
+| `writePolicy` | `'both' \| 'local-first-async-remote'` | `'both'` | Write-through or local-first async write policy. |
+| `backfillOnRemoteHit` | `boolean` | `true` | Backfills L1 after L2 hit. Preserves remote TTL when supported. |
+| `remoteTimeoutMs` | `number` | `50` | L2 get timeout in milliseconds. Timeout falls back to L1 miss behavior. |
+| `publish` | `(msg) => void` | `undefined` | Optional callback for distributed invalidation messages. |
 
----
-
-### `cache-hub/redis` — Redis 适配器
+### `cache-hub/redis`
 
 ```typescript
 import { createRedisCacheAdapter } from 'cache-hub/redis';
 
-// 方式一：URL 字符串（自动创建连接）
 const adapter = createRedisCacheAdapter('redis://localhost:6379');
-
-// 方式二：已有 ioredis 实例（不会被 close() 关闭）
-import Redis from 'ioredis';
-const redis = new Redis();
-const adapter = createRedisCacheAdapter(redis);
-
-// 用完后关闭（仅关闭自己创建的连接）
-await adapter.close();
 ```
 
-> **需要安装 ioredis**：`npm install ioredis`
+The Redis adapter implements `CacheLike` and adds:
 
-`RedisCacheAdapter` 实现完整 `CacheLike` 接口，并额外提供：
+| Method | Description |
+|---|---|
+| `getRemainingTtl(key)` | Returns remaining TTL in milliseconds, `null` for non-expiring keys, and `undefined` for missing keys. |
+| `getRemainingTtlMany(keys)` | Batch TTL lookup. |
+| `close()` | Closes only the connection created by the adapter. Externally supplied ioredis instances are not closed. |
+| `getRedisInstance()` | Returns the underlying ioredis instance for advanced use cases. |
 
-| 方法 | 说明 |
-|------|------|
-| `getRemainingTtl(key)` | 查询 Redis 键的剩余 TTL；不过期键返回 `null`，不存在键返回 `undefined` |
-| `getRemainingTtlMany(keys)` | 批量查询剩余 TTL，返回 key 到 TTL 的映射 |
-| `close()` | 关闭适配器自己创建的连接；传入外部 ioredis 实例时不会关闭 |
+Pattern operations use `SCAN` with `COUNT 100`; `KEYS` is not used.
 
----
-
-### `cache-hub/function-cache` — 函数缓存
+### `cache-hub/function-cache`
 
 ```typescript
-import { withCache, FunctionCache } from 'cache-hub/function-cache';
+import { FunctionCache, withCache } from 'cache-hub/function-cache';
 ```
-
-#### `withCache(fn, options)`
 
 ```typescript
 const cachedFn = withCache(asyncFn, {
-    cache,                          // CacheLike 实例
-    ttl?: number,                   // 毫秒，默认 60000
-    namespace?: string,             // 键前缀，默认函数名
-    keyBuilder?: (...args) => string,  // 自定义键生成
-    condition?: (result) => boolean,   // 返回 false 时不写缓存
+    cache,
+    ttl: 60_000,
+    namespace: 'users',
+    keyBuilder: (...args) => `custom:${args.join(':')}`,
+    condition: (result) => result !== null,
 });
 ```
 
-#### `FunctionCache` 类
+`withCache(fn).invalidateAll()` only deletes keys that were actually written by
+that wrapped function. It does not delete unrelated manual keys that happen to
+share the same prefix.
 
-```typescript
-const fc = new FunctionCache(cache, { ttl: 30_000 });
-
-fc.register('getUser', async (id: number) => db.findUser(id));
-fc.register('getProduct', async (id: number) => db.findProduct(id), { ttl: 10_000 });
-
-const user = await fc.execute('getUser', 1);
-await fc.invalidate('getUser', 1);  // 使指定参数的缓存失效
-
-const stats = fc.getStats();  // { getUser: { hits, misses, ... } }
-```
-
-`withCache(fn).invalidateAll()` 只删除该包装函数实际写入的缓存键；即使底层缓存里存在相同 `namespace:functionName:*` 前缀的手工键，也不会被一并删除。
-
----
-
-### `cache-hub/distributed` — 分布式失效
+### `cache-hub/distributed`
 
 ```typescript
 import { DistributedCacheInvalidator } from 'cache-hub/distributed';
 
-new DistributedCacheInvalidator(options: DistributedInvalidatorOptions)
+const invalidator = new DistributedCacheInvalidator({
+    cache,
+    redisUrl: 'redis://localhost:6379',
+});
 ```
 
-| 选项 | 类型 | 说明 |
-|------|------|------|
-| `cache` | `CacheLike` | 必填，接收失效消息时对该实例执行 `delPattern` |
-| `redisUrl` | `string` | Redis URL，与 `redis` 二选一，均未提供时默认 `redis://localhost:6379` |
-| `redis` | `ioredis` | 已有 Redis 连接，与 `redisUrl` 二选一 |
-| `channel` | `string` | Pub/Sub 频道名，默认 `'cache-hub:invalidate'` |
-| `instanceId` | `string` | 实例唯一 ID，用于过滤自身消息（默认随机生成） |
+| Option | Description |
+|---|---|
+| `cache` | Required cache instance that receives `delPattern(pattern)` calls. |
+| `redisUrl` | Redis URL. Defaults to `redis://localhost:6379` when neither `redisUrl` nor `redis` is provided. |
+| `redis` | Existing ioredis instance used for publishing. |
+| `channel` | Pub/Sub channel. Defaults to `cache-hub:invalidate`. |
+| `instanceId` | Unique instance id used to filter self-sent messages. |
+
+### `cache-hub/rate-limit`
 
 ```typescript
-// 广播失效事件（支持通配符 *）
-await invalidator.invalidate('user:*');
-
-// 查看统计
-const stats = invalidator.getStats();
-// { messagesSent: 5, messagesReceived: 12, invalidationsTriggered: 7, errors: 0, instanceId: '...', channel: '...' }
-
-// 关闭连接
-await invalidator.close();
+import {
+    createMemoryFixedWindowRateLimitStore,
+    createRedisFixedWindowRateLimitStore,
+} from 'cache-hub/rate-limit';
 ```
 
-> **需要安装 ioredis**：`npm install ioredis`
+| API | Description |
+|---|---|
+| `MemoryFixedWindowRateLimitStore` | Synchronous in-memory fixed-window counter. |
+| `RedisFixedWindowRateLimitStore` | Async Redis fixed-window counter backed by Lua scripts. |
+| `increment(key, windowMs, limit, amount?)` | Increments the current window and returns hits, remaining quota, reset time, and retry-after. |
+| `decrement(key, amount?)` | Rolls back a counter, useful when downstream work fails after reservation. |
+| `reset(key)` | Deletes one rate-limit key. |
+| `resetPrefix(prefix)` | Deletes keys under a literal prefix with SCAN. |
 
----
-
-### `cache-hub/stringify` — 稳定序列化
+### `cache-hub/stringify`
 
 ```typescript
 import { stableStringify } from 'cache-hub/stringify';
 
-// 键排序，确定性输出
-stableStringify({ b: 2, a: 1 })          // '{"a":1,"b":2}'
+stableStringify({ b: 2, a: 1 }); // '{"a":1,"b":2}'
+stableStringify(NaN); // '"__NaN__"'
+```
 
-// 特殊值处理
-stableStringify(NaN)                      // '"__NaN__"'（避免与字符串 "NaN" 碰撞）
-stableStringify({ a: { ref: undefined } }) // 循环引用输出 "[CIRCULAR]"
+`stableStringify` sorts object keys, handles cycles, supports custom
+serializers, and keeps cache keys deterministic across processes.
 
-// 自定义序列化器（如 BSON ObjectId）
-stableStringify(value, {
-    customSerializer: (v) => {
-        if (v instanceof ObjectId) return v.toHexString();
-        return undefined;  // undefined 表示使用默认序列化
-    }
-});
+---
+
+## Redis Defaults
+
+Redis-backed examples use:
+
+```text
+redis://localhost:6379
+```
+
+This URL means local Redis on port `6379` with no password. If your Redis
+requires authentication, use the standard Redis URL form:
+
+```text
+redis://:password@host:6379
+```
+
+For tests, set `REDIS_URL` when you need a non-default endpoint:
+
+```bash
+REDIS_URL=redis://127.0.0.1:6379 npm run test:integration
 ```
 
 ---
 
-## 测试
+## Testing
 
 ```bash
-# 全量测试（503 个，集成测试在无 Redis 时自动跳过）
+# All Vitest tests; Redis integration tests run when Redis is reachable
 npm test
 
-# 单元测试 + 覆盖率报告
+# Coverage
 npm run test:coverage
 
-# 集成测试（需要本地 Redis）
+# Redis integration tests only
 npm run test:integration
 
-# 指定 Redis 地址
-REDIS_URL=redis://myhost:6380 npm run test:integration
-
-# 跳过集成测试
+# Skip Redis integration tests explicitly
 SKIP_INTEGRATION=true npm run test:integration
 ```
 
-覆盖率目标：**Statements / Branches / Functions / Lines 全部 100%**
+`npm test` runs the full Vitest suite. Redis integration cases execute when a
+reachable Redis server is available; otherwise they log a skip message.
+Integration tests require `ioredis` in the development environment. The package
+keeps `ioredis` as an optional peer dependency for consumers and as a dev
+dependency for real integration coverage.
+
+Coverage target: statements, branches, functions, and lines all at 100%.
 
 ---
 
-## 构建
+## Benchmarking
 
 ```bash
-# 完整构建（ESM + CJS + 类型声明）
-npm run build
+# Build first, then print benchmark tables
+npm run benchmark
 
-# 仅类型检查
-npm run typecheck
+# Print JSON to stdout
+npm run benchmark -- --json
+
+# Write JSON to a file
+npm run benchmark -- --json --output benchmark-results.json
 ```
 
-构建产物：
-```
-dist/
-├── esm/      # ES Module 格式（.js）
-├── cjs/      # CommonJS 格式（.js）
-└── types/    # TypeScript 类型声明（.d.ts）
-```
+The benchmark script focuses on direct library hot paths. Treat the numbers as
+local performance signals, not as a replacement for production HTTP middleware
+or real Redis network benchmarks.
 
 ---
 
-## Node.js 版本兼容性
+## Build
 
-| Node.js | 支持 |
-|---------|:----:|
-| 16 LTS  | ✅   |
-| 18 LTS  | ✅   |
-| 20 LTS  | ✅   |
-| 22 LTS  | ✅   |
+```bash
+# Type check only
+npm run typecheck
+
+# Build ESM, CommonJS, and declaration files
+npm run build
+```
+
+Build output:
+
+```text
+dist/
+├── esm/
+├── cjs/
+└── types/
+```
+
+The package exposes matching ESM, CJS, and type declaration paths for every
+public subpath export.
+
+---
+
+## Node.js Support
+
+| Node.js | Status |
+|---|:---:|
+| 18 LTS | Supported |
+| 20 LTS | Supported |
+| 22 LTS | Supported |
+
+`cache-hub` requires Node.js `>=18.0.0`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `redis-adapter requires ioredis` | Install `ioredis` in the consuming project: `npm install ioredis`. |
+| Redis tests are skipped | Confirm Redis is running and `REDIS_URL` points to the reachable endpoint. |
+| Redis auth fails | Use `redis://:password@host:6379` or pass an already configured ioredis instance. |
+| Pattern deletes are slower than expected | `delPattern` and `keys` use SCAN for safety; this avoids blocking Redis like KEYS. |
+| Cache misses after storing `undefined` | `undefined` is the miss signal. Use `null` or a sentinel object for cacheable empty results. |
 
 ---
 

@@ -50,3 +50,16 @@ export type {
   DistributedInvalidatorLogger,
   InvalidatorStats,
 } from "./distributed-invalidator.js";
+
+// 可选限流原语
+export {
+  MemoryFixedWindowRateLimitStore,
+  RedisFixedWindowRateLimitStore,
+  createMemoryFixedWindowRateLimitStore,
+  createRedisFixedWindowRateLimitStore,
+} from "./rate-limit.js";
+export type {
+  FixedWindowRateLimitResult,
+  FixedWindowRateLimitStore,
+  RedisFixedWindowRateLimitClient,
+} from "./types.js";

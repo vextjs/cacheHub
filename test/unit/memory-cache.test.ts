@@ -326,6 +326,14 @@ describe("MemoryCache", () => {
         cache.set("k", null);
         expect(cache.getMany(["k"])).toEqual({ k: null });
       });
+
+      it("enabled=false 时 getMany 返回空对象但仍校验 key", () => {
+        const c = makeCache({ enabled: false });
+        c.set("k", "v");
+        expect(c.getMany(["k"])).toEqual({});
+        expect(() => c.getMany([""])).toThrow(TypeError);
+        c.destroy();
+      });
     });
 
     describe("setMany", () => {
@@ -346,6 +354,23 @@ describe("MemoryCache", () => {
         await sleep(30);
         expect(cache.get("k1")).toBeUndefined();
       });
+
+      it("setMany 在 disabled 缓存上不写入但仍校验 key", () => {
+        const c = makeCache({ enabled: false });
+        expect(c.setMany({ k: "v" })).toBe(true);
+        expect(c.get("k")).toBeUndefined();
+        expect(() => c.setMany({ "": "v" })).toThrow(TypeError);
+        c.destroy();
+      });
+
+      it("setMany 批量写入后统一执行容量淘汰", () => {
+        const c = makeCache({ maxEntries: 2 });
+        c.setMany({ a: 1, b: 2, c: 3 });
+        expect(c.get("a")).toBeUndefined();
+        expect(c.get("b")).toBe(2);
+        expect(c.get("c")).toBe(3);
+        c.destroy();
+      });
     });
 
     describe("delMany", () => {
@@ -363,6 +388,10 @@ describe("MemoryCache", () => {
 
       it("空数组返回 0（A16）", () => {
         expect(cache.delMany([])).toBe(0);
+      });
+
+      it("delMany 对非法 key 抛出 TypeError", () => {
+        expect(() => cache.delMany([""])).toThrow(TypeError);
       });
     });
   });
