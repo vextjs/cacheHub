@@ -94,6 +94,42 @@ export interface LockManager {
 }
 
 /**
+ * 原子计数器操作结果。
+ */
+export interface AtomicCounterResult {
+    key: string;
+    value: number;
+    ttlMs: number | null;
+}
+
+/**
+ * 通用原子状态后端。
+ *
+ * 该接口是可选扩展，不属于 CacheLike 必需契约。
+ */
+export interface AtomicStateBackend {
+    incrementWithTtl(key: string, delta: number, ttlMs: number): AtomicCounterResult | Promise<AtomicCounterResult>;
+    decrement(key: string, delta?: number): number | Promise<number>;
+    reset(key: string): boolean | Promise<boolean>;
+    resetPrefix(prefix: string): number | Promise<number>;
+}
+
+/**
+ * Redis 原子后端所需的最小客户端能力。
+ */
+export interface RedisAtomicStateClient {
+    eval(script: string, keyCount: number, ...args: Array<string | number>): Promise<unknown>;
+    del(...keys: string[]): Promise<number>;
+    scan(
+        cursor: string,
+        matchKeyword: 'MATCH',
+        pattern: string,
+        countKeyword: 'COUNT',
+        count: number
+    ): Promise<[string, string[]]>;
+}
+
+/**
  * 固定窗口限流计数结果。
  */
 export interface FixedWindowRateLimitResult {
@@ -123,16 +159,82 @@ export interface FixedWindowRateLimitStore {
 }
 
 /**
+ * 滑动窗口限流状态结果。
+ */
+export interface SlidingWindowRateLimitResult {
+    key: string;
+    count: number;
+    limit: number;
+    allowed: boolean;
+    remaining: number;
+    resetTime: Date;
+    retryAfterMs: number;
+    rollbackToken?: string;
+}
+
+/**
+ * Token bucket 限流状态结果。
+ */
+export interface TokenBucketRateLimitResult {
+    key: string;
+    allowed: boolean;
+    tokens: number;
+    capacity: number;
+    remaining: number;
+    resetTime: Date;
+    retryAfterMs: number;
+    rollbackToken?: string;
+}
+
+/**
+ * Leaky bucket 限流状态结果。
+ */
+export interface LeakyBucketRateLimitResult {
+    key: string;
+    allowed: boolean;
+    waterLevel: number;
+    capacity: number;
+    remaining: number;
+    resetTime: Date;
+    retryAfterMs: number;
+    rollbackToken?: string;
+}
+
+/**
+ * 限流状态原语集合。
+ */
+export interface RateLimitStateStore {
+    checkSlidingWindow(
+        key: string,
+        windowMs: number,
+        limit: number,
+        cost?: number
+    ): SlidingWindowRateLimitResult | Promise<SlidingWindowRateLimitResult>;
+    rollbackSlidingWindow(key: string, rollbackToken: string): boolean | Promise<boolean>;
+    consumeTokenBucket(
+        key: string,
+        capacity: number,
+        refillPerSecond: number,
+        cost?: number
+    ): TokenBucketRateLimitResult | Promise<TokenBucketRateLimitResult>;
+    rollbackTokenBucket(key: string, rollbackToken: string): boolean | Promise<boolean>;
+    consumeLeakyBucket(
+        key: string,
+        capacity: number,
+        leakPerSecond: number,
+        cost?: number
+    ): LeakyBucketRateLimitResult | Promise<LeakyBucketRateLimitResult>;
+    rollbackLeakyBucket(key: string, rollbackToken: string): boolean | Promise<boolean>;
+    reset(key: string): boolean | Promise<boolean>;
+    resetPrefix(prefix: string): number | Promise<number>;
+}
+
+/**
+ * Redis 限流状态原语所需的最小客户端能力。
+ */
+export interface RedisRateLimitStateClient extends RedisAtomicStateClient {}
+
+/**
  * Redis 固定窗口原语所需的最小客户端能力。
  */
-export interface RedisFixedWindowRateLimitClient {
-    eval(script: string, keyCount: number, ...args: Array<string | number>): Promise<unknown>;
-    del(...keys: string[]): Promise<number>;
-    scan(
-        cursor: string,
-        matchKeyword: 'MATCH',
-        pattern: string,
-        countKeyword: 'COUNT',
-        count: number
-    ): Promise<[string, string[]]>;
-}
+export interface RedisFixedWindowRateLimitClient extends RedisAtomicStateClient {}

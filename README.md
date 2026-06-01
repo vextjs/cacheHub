@@ -1,11 +1,11 @@
 # cache-hub
 
-Zero-runtime-dependency multi-level caching toolkit for Node.js services.
+Zero-runtime-dependency caching and atomic state toolkit for Node.js services.
 
 `cache-hub` provides an in-memory LRU + TTL cache, optional Redis integration,
 read-through caching, function-level caching, distributed invalidation, stable
-cache-key serialization, and fixed-window rate-limit primitives behind a small
-`CacheLike` contract.
+cache-key serialization, atomic state backends, and rate-limit state primitives
+behind a small `CacheLike` contract.
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -41,7 +41,8 @@ Chinese documentation: [docs/README.zh-CN.md](./docs/README.zh-CN.md)
 - **Function cache** - cache any async function with `withCache` or the `FunctionCache` registry.
 - **Distributed invalidation** - Redis Pub/Sub broadcasts cache invalidation across service instances.
 - **Stable key serialization** - deterministic cache keys with sorted object keys, cycle handling, and special value sentinels.
-- **Rate-limit primitives** - optional fixed-window stores for memory and Redis-backed HTTP middleware implementations.
+- **Atomic state backends** - memory and Redis counter primitives for high-concurrency state updates.
+- **Rate-limit primitives** - fixed-window, sliding-window, token-bucket, and leaky-bucket state stores for middleware authors.
 - **Dual package format** - ESM and CommonJS builds with subpath exports.
 
 ---
@@ -206,6 +207,25 @@ await redisCache.close();
 `cache-hub/rate-limit` is a low-level primitive for middleware authors. It does
 not impose a specific HTTP framework adapter.
 
+### Atomic State Backend
+
+```typescript
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+import { createRedisAtomicStateBackend } from 'cache-hub/atomic';
+
+const redisCache = createRedisCacheAdapter('redis://localhost:6379');
+const atomic = createRedisAtomicStateBackend(redisCache);
+
+const result = await atomic.incrementWithTtl('counter:tenant:42', 1, 60_000);
+
+console.log(result.value, result.ttlMs);
+await redisCache.close();
+```
+
+The Redis backend uses Lua scripts for atomic read-modify-write behavior. It is
+safe to use as a storage primitive for high-concurrency counters where plain
+`get -> set` would lose updates.
+
 ---
 
 ## Module Reference
@@ -353,12 +373,32 @@ const invalidator = new DistributedCacheInvalidator({
 | `channel` | Pub/Sub channel. Defaults to `cache-hub:invalidate`. |
 | `instanceId` | Unique instance id used to filter self-sent messages. |
 
+### `cache-hub/atomic`
+
+```typescript
+import {
+    createMemoryAtomicStateBackend,
+    createRedisAtomicStateBackend,
+} from 'cache-hub/atomic';
+```
+
+| API | Description |
+|---|---|
+| `MemoryAtomicStateBackend` | Synchronous in-memory atomic counter backend. |
+| `RedisAtomicStateBackend` | Async Redis atomic counter backend backed by Lua scripts. |
+| `incrementWithTtl(key, amount, ttlMs)` | Atomically increments a counter and assigns TTL on first write. |
+| `decrement(key, amount?)` | Atomically decrements a counter while preserving TTL. |
+| `reset(key)` | Deletes one atomic state key. |
+| `resetPrefix(prefix)` | Deletes keys under a literal prefix with SCAN. |
+
 ### `cache-hub/rate-limit`
 
 ```typescript
 import {
     createMemoryFixedWindowRateLimitStore,
+    createMemoryRateLimitStateStore,
     createRedisFixedWindowRateLimitStore,
+    createRedisRateLimitStateStore,
 } from 'cache-hub/rate-limit';
 ```
 
@@ -366,8 +406,13 @@ import {
 |---|---|
 | `MemoryFixedWindowRateLimitStore` | Synchronous in-memory fixed-window counter. |
 | `RedisFixedWindowRateLimitStore` | Async Redis fixed-window counter backed by Lua scripts. |
+| `MemoryRateLimitStateStore` | In-memory sliding-window, token-bucket, and leaky-bucket state primitives. |
+| `RedisRateLimitStateStore` | Redis Lua-backed sliding-window, token-bucket, and leaky-bucket state primitives. |
 | `increment(key, windowMs, limit, amount?)` | Increments the current window and returns hits, remaining quota, reset time, and retry-after. |
 | `decrement(key, amount?)` | Rolls back a counter, useful when downstream work fails after reservation. |
+| `checkSlidingWindow(key, windowMs, limit, cost?)` | Reserves sliding-window state and returns an opaque rollback token when allowed. |
+| `consumeTokenBucket(key, capacity, refillPerSecond, cost?)` | Atomically consumes token-bucket capacity and returns retry timing. |
+| `consumeLeakyBucket(key, capacity, leakPerSecond, cost?)` | Atomically consumes leaky-bucket capacity and returns retry timing. |
 | `reset(key)` | Deletes one rate-limit key. |
 | `resetPrefix(prefix)` | Deletes keys under a literal prefix with SCAN. |
 

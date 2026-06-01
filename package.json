@@ -1,10 +1,10 @@
 {
   "name": "cache-hub",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "types": "./dist/types/index.d.ts",
-  "description": "Zero-runtime-dependency multi-level caching toolkit for Node.js services.",
+  "description": "Zero-runtime-dependency caching and atomic state toolkit for Node.js services.",
   "keywords": [
     "cache",
     "caching",
@@ -18,8 +18,13 @@
     "read-through",
     "function-cache",
     "distributed-cache",
+    "atomic-counter",
+    "atomic-state",
     "rate-limit",
     "fixed-window",
+    "sliding-window",
+    "token-bucket",
+    "leaky-bucket",
     "zero-dependency"
   ],
   "license": "MIT",
@@ -63,6 +68,11 @@
       "types": "./dist/types/read-through.d.ts",
       "import": "./dist/esm/read-through.js",
       "require": "./dist/cjs/read-through.js"
+    },
+    "./atomic": {
+      "types": "./dist/types/atomic.d.ts",
+      "import": "./dist/esm/atomic.js",
+      "require": "./dist/cjs/atomic.js"
     },
     "./rate-limit": {
       "types": "./dist/types/rate-limit.d.ts",

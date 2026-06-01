@@ -12,6 +12,9 @@ export type {
   CacheStats,
   MemoryCacheOptions,
   LockManager,
+  AtomicCounterResult,
+  AtomicStateBackend,
+  RedisAtomicStateClient,
 } from "./types.js";
 
 // 核心实现
@@ -54,12 +57,29 @@ export type {
 // 可选限流原语
 export {
   MemoryFixedWindowRateLimitStore,
+  MemoryRateLimitStateStore,
   RedisFixedWindowRateLimitStore,
+  RedisRateLimitStateStore,
   createMemoryFixedWindowRateLimitStore,
+  createMemoryRateLimitStateStore,
   createRedisFixedWindowRateLimitStore,
+  createRedisRateLimitStateStore,
 } from "./rate-limit.js";
 export type {
   FixedWindowRateLimitResult,
   FixedWindowRateLimitStore,
+  SlidingWindowRateLimitResult,
+  TokenBucketRateLimitResult,
+  LeakyBucketRateLimitResult,
+  RateLimitStateStore,
   RedisFixedWindowRateLimitClient,
+  RedisRateLimitStateClient,
 } from "./types.js";
+
+// 原子状态后端
+export {
+  MemoryAtomicStateBackend,
+  RedisAtomicStateBackend,
+  createMemoryAtomicStateBackend,
+  createRedisAtomicStateBackend,
+} from "./atomic.js";

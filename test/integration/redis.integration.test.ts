@@ -20,6 +20,8 @@ import type { RedisCacheAdapter } from "../../src/redis-adapter.js";
 import { DistributedCacheInvalidator } from "../../src/distributed-invalidator.js";
 import { MultiLevelCache } from "../../src/multi-level-cache.js";
 import { MemoryCache } from "../../src/memory-cache.js";
+import { createRedisAtomicStateBackend } from "../../src/atomic.js";
+import { createRedisRateLimitStateStore } from "../../src/rate-limit.js";
 
 // ── 环境配置 ──
 
@@ -364,6 +366,99 @@ describeIfRedis("Redis 集成测试", () => {
       const instance = adapter.getRedisInstance();
       expect(instance).toBeDefined();
       expect(typeof (instance as any).ping).toBe("function");
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // 原子状态与限流状态原语
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("Redis 原子状态与限流状态原语", () => {
+    let adapter: RedisCacheAdapter;
+
+    beforeAll(async () => {
+      if (!redisAvailable) return;
+      adapter = createRedisCacheAdapter(REDIS_URL);
+    });
+
+    afterAll(async () => {
+      if (!redisAvailable || !adapter) return;
+      try {
+        await adapter.delPattern(`${TEST_PREFIX}atomic:*`);
+        await adapter.delPattern(`${TEST_PREFIX}rl:*`);
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    beforeEach(async () => {
+      if (!redisAvailable || !adapter) return;
+      await adapter.delPattern(`${TEST_PREFIX}atomic:*`);
+      await adapter.delPattern(`${TEST_PREFIX}rl:*`);
+    });
+
+    it("atomic incrementWithTtl 在 100 并发、10,000 次操作下不丢计数", async () => {
+      if (!redisAvailable) return;
+
+      const backend = createRedisAtomicStateBackend(adapter);
+      const key = `${TEST_PREFIX}atomic:counter`;
+      const workers = Array.from({ length: 100 }, async () => {
+        for (let i = 0; i < 100; i++) {
+          await backend.incrementWithTtl(key, 1, 60000);
+        }
+      });
+
+      await Promise.all(workers);
+      const redis = adapter.getRedisInstance() as any;
+      const value = await redis.get(key);
+      const ttl = await redis.pttl(key);
+
+      expect(Number(value)).toBe(10000);
+      expect(ttl).toBeGreaterThan(0);
+    });
+
+    it("sliding-window 原语在并发消费时不突破 limit，并支持 rollback token", async () => {
+      if (!redisAvailable) return;
+
+      const store = createRedisRateLimitStateStore(adapter);
+      const key = `${TEST_PREFIX}rl:sliding`;
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => store.checkSlidingWindow(key, 1000, 5)),
+      );
+      const allowed = results.filter((result) => result.allowed);
+
+      expect(allowed).toHaveLength(5);
+      expect(results.filter((result) => !result.allowed)).toHaveLength(5);
+      expect(await store.rollbackSlidingWindow(key, allowed[0].rollbackToken!)).toBe(true);
+      expect((await store.checkSlidingWindow(key, 1000, 5)).allowed).toBe(true);
+    });
+
+    it("token-bucket 原语支持原子消耗与 rollback", async () => {
+      if (!redisAvailable) return;
+
+      const store = createRedisRateLimitStateStore(adapter);
+      const key = `${TEST_PREFIX}rl:token`;
+      const first = await store.consumeTokenBucket(key, 3, 1, 3);
+      const blocked = await store.consumeTokenBucket(key, 3, 1);
+
+      expect(first.allowed).toBe(true);
+      expect(blocked.allowed).toBe(false);
+      expect(await store.rollbackTokenBucket(key, first.rollbackToken!)).toBe(true);
+      expect((await store.consumeTokenBucket(key, 3, 1)).allowed).toBe(true);
+    });
+
+    it("leaky-bucket 原语支持原子入水与 rollback", async () => {
+      if (!redisAvailable) return;
+
+      const store = createRedisRateLimitStateStore(adapter);
+      const key = `${TEST_PREFIX}rl:leaky`;
+      const first = await store.consumeLeakyBucket(key, 3, 1, 3);
+      const blocked = await store.consumeLeakyBucket(key, 3, 1);
+
+      expect(first.allowed).toBe(true);
+      expect(blocked.allowed).toBe(false);
+      expect(await store.rollbackLeakyBucket(key, first.rollbackToken!)).toBe(true);
+      expect((await store.consumeLeakyBucket(key, 3, 1)).allowed).toBe(true);
     });
   });
 

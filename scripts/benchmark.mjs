@@ -15,7 +15,11 @@ import { MultiLevelCache } from '../dist/esm/multi-level-cache.js';
 import { readThrough } from '../dist/esm/read-through.js';
 import { withCache } from '../dist/esm/function-cache.js';
 import { createRedisCacheAdapter } from '../dist/esm/redis-adapter.js';
-import { createMemoryFixedWindowRateLimitStore } from '../dist/esm/rate-limit.js';
+import { createMemoryAtomicStateBackend } from '../dist/esm/atomic.js';
+import {
+    createMemoryFixedWindowRateLimitStore,
+    createMemoryRateLimitStateStore,
+} from '../dist/esm/rate-limit.js';
 
 const args = process.argv.slice(2);
 const json = args.includes('--json');
@@ -141,6 +145,8 @@ const redisAdapter = createRedisCacheAdapter(createFakeRedis());
 await redisAdapter.set('redis-hit', { id: 1 });
 
 const rateLimitStore = createMemoryFixedWindowRateLimitStore();
+const atomicBackend = createMemoryAtomicStateBackend();
+const rateLimitStateStore = createMemoryRateLimitStateStore();
 
 const results = [];
 results.push(await bench('MemoryCache#get hit', () => memory.get('hit')));
@@ -153,7 +159,14 @@ results.push(await bench('MultiLevelCache L1 hit', () => multiLevel.get('l1-hit'
 results.push(await bench('MultiLevelCache L1 miss + remote miss', () => multiLevel.get('remote-miss')));
 results.push(await bench('RedisAdapter(fake) get JSON parse', () => redisAdapter.get('redis-hit')));
 results.push(await bench('RedisAdapter(fake) set JSON stringify', () => redisAdapter.set('redis-hit', { id: 2 })));
+results.push(await bench('Atomic Memory incrementWithTtl', () => atomicBackend.incrementWithTtl('atomic:user:1', 1, 60000)));
 results.push(await bench('RateLimit Memory fixed-window increment', () => rateLimitStore.increment('rl:user:1', 60000, 1000000)));
+results.push(await bench(
+    'RateLimit Memory sliding-window check',
+    () => rateLimitStateStore.checkSlidingWindow('sw:user:1', 60000, 1000000),
+    { iterations: 1000 },
+));
+results.push(await bench('RateLimit Memory token-bucket consume', () => rateLimitStateStore.consumeTokenBucket('tb:user:1', 1000000, 1000000)));
 
 if (json) {
     const payload = JSON.stringify({ generatedAt: new Date().toISOString(), results }, null, 2);

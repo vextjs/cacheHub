@@ -1,8 +1,8 @@
 # cache-hub 中文文档
 
-零运行时依赖的 Node.js 多层缓存工具库。
+零运行时依赖的 Node.js 缓存与原子状态工具库。
 
-`cache-hub` 提供内存 LRU + TTL 缓存、可选 Redis 集成、读穿缓存、函数级缓存、分布式失效、稳定缓存键序列化，以及固定窗口限流原语。所有核心能力都围绕轻量的 `CacheLike` 契约组织，便于在不同 Node.js 服务中复用。
+`cache-hub` 提供内存 LRU + TTL 缓存、可选 Redis 集成、读穿缓存、函数级缓存、分布式失效、稳定缓存键序列化、原子状态后端，以及限流状态原语。所有核心能力都围绕轻量的 `CacheLike` 契约组织，便于在不同 Node.js 服务中复用。
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
@@ -38,7 +38,8 @@
 - **函数缓存**：通过 `withCache` 或 `FunctionCache` 缓存任意异步函数。
 - **分布式失效**：通过 Redis Pub/Sub 在多个服务实例之间广播缓存失效。
 - **稳定键序列化**：对象键排序、循环引用处理、特殊值哨兵，保证不同进程中的缓存键确定性。
-- **限流原语**：提供内存与 Redis 固定窗口计数存储，便于 HTTP middleware 作者接入。
+- **原子状态后端**：提供内存与 Redis 计数器原语，适合高并发状态更新。
+- **限流原语**：提供固定窗口、滑动窗口、token bucket、leaky bucket 状态存储，便于 HTTP middleware 作者接入。
 - **双格式发布**：同时提供 ESM、CommonJS 和类型声明，多入口按需导入。
 
 ---
@@ -197,6 +198,23 @@ await redisCache.close();
 
 `cache-hub/rate-limit` 是面向 middleware 作者的低层原语，不绑定具体 HTTP 框架。
 
+### 原子状态后端
+
+```typescript
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+import { createRedisAtomicStateBackend } from 'cache-hub/atomic';
+
+const redisCache = createRedisCacheAdapter('redis://localhost:6379');
+const atomic = createRedisAtomicStateBackend(redisCache);
+
+const result = await atomic.incrementWithTtl('counter:tenant:42', 1, 60_000);
+
+console.log(result.value, result.ttlMs);
+await redisCache.close();
+```
+
+Redis 后端使用 Lua 脚本保证原子读改写。对于高并发计数器，这比普通 `get -> set` 更安全，不会因为并发覆盖导致计数丢失。
+
 ---
 
 ## 模块参考
@@ -340,12 +358,32 @@ const invalidator = new DistributedCacheInvalidator({
 | `channel` | Pub/Sub 频道，默认 `cache-hub:invalidate`。 |
 | `instanceId` | 当前实例 ID，用于过滤自身消息。 |
 
+### `cache-hub/atomic`
+
+```typescript
+import {
+    createMemoryAtomicStateBackend,
+    createRedisAtomicStateBackend,
+} from 'cache-hub/atomic';
+```
+
+| API | 说明 |
+|---|---|
+| `MemoryAtomicStateBackend` | 同步内存原子计数后端。 |
+| `RedisAtomicStateBackend` | 基于 Lua 脚本的异步 Redis 原子计数后端。 |
+| `incrementWithTtl(key, amount, ttlMs)` | 原子递增计数器，并在首次写入时设置 TTL。 |
+| `decrement(key, amount?)` | 原子递减计数器并保留 TTL。 |
+| `reset(key)` | 删除单个原子状态 key。 |
+| `resetPrefix(prefix)` | 使用 SCAN 删除字面量前缀下的 key。 |
+
 ### `cache-hub/rate-limit`
 
 ```typescript
 import {
     createMemoryFixedWindowRateLimitStore,
+    createMemoryRateLimitStateStore,
     createRedisFixedWindowRateLimitStore,
+    createRedisRateLimitStateStore,
 } from 'cache-hub/rate-limit';
 ```
 
@@ -353,8 +391,13 @@ import {
 |---|---|
 | `MemoryFixedWindowRateLimitStore` | 同步内存固定窗口计数器。 |
 | `RedisFixedWindowRateLimitStore` | 基于 Lua 脚本的异步 Redis 固定窗口计数器。 |
+| `MemoryRateLimitStateStore` | 内存滑动窗口、token bucket、leaky bucket 状态原语。 |
+| `RedisRateLimitStateStore` | 基于 Redis Lua 的滑动窗口、token bucket、leaky bucket 状态原语。 |
 | `increment(key, windowMs, limit, amount?)` | 增加当前窗口计数，并返回 hits、remaining、resetTime、retryAfter 等状态。 |
 | `decrement(key, amount?)` | 回滚计数，适合下游处理失败后的补偿。 |
+| `checkSlidingWindow(key, windowMs, limit, cost?)` | 预留滑动窗口状态，允许时返回不透明 rollback token。 |
+| `consumeTokenBucket(key, capacity, refillPerSecond, cost?)` | 原子消耗 token bucket 容量，并返回重试时间。 |
+| `consumeLeakyBucket(key, capacity, leakPerSecond, cost?)` | 原子消耗 leaky bucket 容量，并返回重试时间。 |
 | `reset(key)` | 删除单个限流 key。 |
 | `resetPrefix(prefix)` | 使用 SCAN 删除字面量前缀下的限流 key。 |
 
