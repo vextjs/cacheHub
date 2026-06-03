@@ -8,9 +8,13 @@
 // 核心类型
 export type {
   CacheLike,
+  CacheLease,
+  CacheLeaseStore,
   CacheRemainingTtl,
+  CacheSetOptions,
   CacheStats,
   MemoryCacheOptions,
+  RedisLeaseClient,
   LockManager,
   AtomicCounterResult,
   AtomicStateBackend,
@@ -26,7 +30,12 @@ export { stableStringify } from "./stable-stringify.js";
 export type { StableStringifyOptions } from "./stable-stringify.js";
 
 // 读穿缓存
-export { readThrough } from "./read-through.js";
+export { readThrough, readThroughWithLease } from "./read-through.js";
+export type { ReadThroughWithLeaseOptions } from "./read-through.js";
+
+// Redis lease
+export { createRedisLeaseStore } from "./redis-lease.js";
+export type { RedisLeaseStore, RedisLeaseStoreOptions } from "./redis-lease.js";
 
 // 多级缓存
 export { MultiLevelCache } from "./multi-level-cache.js";
@@ -34,7 +43,7 @@ export type { MultiLevelCacheOptions } from "./multi-level-cache.js";
 
 // Redis 适配器
 export { createRedisCacheAdapter } from "./redis-adapter.js";
-export type { RedisCacheAdapter } from "./redis-adapter.js";
+export type { RedisCacheAdapter, RedisCacheAdapterOptions } from "./redis-adapter.js";
 
 // 函数缓存
 export { withCache, FunctionCache } from "./function-cache.js";

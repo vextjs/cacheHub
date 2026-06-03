@@ -14,11 +14,13 @@
  */
 
 import { createRequire } from 'module';
+import { createHash } from 'crypto';
 
 // ── 常量 ──
 
 const SCAN_COUNT = 100;
 const PATTERN_MAX_LENGTH = 512;
+const DEFAULT_META_KEY_PREFIX = '__cache-hub';
 
 // ── 动态加载 ioredis（optional peer dep）──
 
@@ -41,7 +43,18 @@ function loadIoredis(): any {
 
 // ── 接口扩展 ──
 
-import type { CacheLike, CacheRemainingTtl, CacheStats } from './types.js';
+import type {
+    CacheLike,
+    CacheRemainingTtl,
+    CacheSetOptions,
+    CacheStats,
+} from './types.js';
+
+export interface RedisCacheAdapterOptions {
+    metaKeyPrefix?: string;
+    scanCount?: number;
+    deleteCommand?: 'del' | 'unlink';
+}
 
 /**
  * Redis 适配器扩展方法（close + getRedisInstance）
@@ -51,6 +64,8 @@ export interface RedisCacheAdapter extends CacheLike {
     close(): Promise<void>;
     /** 获取底层 ioredis 实例（用于高级操作） */
     getRedisInstance(): object;
+    /** 按 tag 失效缓存条目 */
+    invalidateByTag(tag: string): Promise<number>;
 }
 
 // ── 内部实现类 ──
@@ -59,9 +74,15 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
     private readonly _redis: any;
     /** A17：标记是否由 adapter 自建连接，仅自建时才在 close() 中关闭 */
     private readonly _shouldCloseOnDestroy: boolean;
+    private readonly _metaKeyPrefix: string;
+    private readonly _scanCount: number;
+    private readonly _deleteCommand: 'del' | 'unlink';
 
-    constructor(urlOrInstance: string | object) {
+    constructor(urlOrInstance: string | object, options: RedisCacheAdapterOptions = {}) {
         this._shouldCloseOnDestroy = typeof urlOrInstance === 'string';
+        this._metaKeyPrefix = options.metaKeyPrefix ?? DEFAULT_META_KEY_PREFIX;
+        this._scanCount = this._normalizeScanCount(options.scanCount);
+        this._deleteCommand = options.deleteCommand ?? 'del';
 
         if (this._shouldCloseOnDestroy) {
             // 传入 URL 字符串：动态加载 ioredis 并自建连接
@@ -89,6 +110,111 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         for (const key of keys) {
             this._validateKey(key);
         }
+    }
+
+    private _validateTag(tag: string): void {
+        if (typeof tag !== 'string' || tag === '') {
+            throw new TypeError(
+                `[cache-hub] tag 必须为非空字符串，收到: ${JSON.stringify(tag)}`
+            );
+        }
+    }
+
+    private _normalizeScanCount(count: number | undefined): number {
+        if (count === undefined) {
+            return SCAN_COUNT;
+        }
+        if (!Number.isFinite(count) || count <= 0) {
+            throw new RangeError(
+                `[cache-hub] scanCount 必须为正数，收到: ${JSON.stringify(count)}`
+            );
+        }
+        return Math.floor(count);
+    }
+
+    private _hash(value: string): string {
+        return createHash('sha256').update(value).digest('hex');
+    }
+
+    private _tagKey(tag: string): string {
+        return `${this._metaKeyPrefix}:tag:${this._hash(tag)}`;
+    }
+
+    private _keyTagsKey(key: string): string {
+        return `${this._metaKeyPrefix}:key-tags:${this._hash(key)}`;
+    }
+
+    private _normalizeTags(tags: string[] | undefined): string[] | undefined {
+        if (tags === undefined) {
+            return undefined;
+        }
+        if (!Array.isArray(tags)) {
+            throw new TypeError('[cache-hub] tags 必须为字符串数组');
+        }
+        const unique = new Set<string>();
+        for (const tag of tags) {
+            this._validateTag(tag);
+            unique.add(tag);
+        }
+        return [...unique];
+    }
+
+    private async _getTagsForKey(key: string): Promise<string[]> {
+        if (typeof this._redis.smembers !== 'function') {
+            return [];
+        }
+        return await this._redis.smembers(this._keyTagsKey(key));
+    }
+
+    private async _cleanupTagsForKey(key: string, skipTag?: string): Promise<void> {
+        const tags = await this._getTagsForKey(key);
+        if (tags.length === 0) {
+            return;
+        }
+        const pipeline = this._redis.pipeline();
+        for (const tag of tags) {
+            if (tag === skipTag) {
+                continue;
+            }
+            pipeline.srem(this._tagKey(tag), key);
+        }
+        pipeline.del(this._keyTagsKey(key));
+        await pipeline.exec();
+    }
+
+    private async _replaceTagsForKey(key: string, tags: string[]): Promise<void> {
+        await this._cleanupTagsForKey(key);
+        if (tags.length === 0) {
+            return;
+        }
+        const pipeline = this._redis.pipeline();
+        for (const tag of tags) {
+            pipeline.sadd(this._tagKey(tag), key);
+        }
+        pipeline.sadd(this._keyTagsKey(key), ...tags);
+        await pipeline.exec();
+    }
+
+    private _deleteInPipeline(pipeline: any, key: string): void {
+        if (this._deleteCommand === 'unlink' && typeof pipeline.unlink === 'function') {
+            pipeline.unlink(key);
+            return;
+        }
+        pipeline.del(key);
+    }
+
+    private async _deleteKeys(keys: string[], skipCleanupTag?: string): Promise<number> {
+        if (keys.length === 0) {
+            return 0;
+        }
+        this._validateKeys(keys);
+        for (const key of keys) {
+            await this._cleanupTagsForKey(key, skipCleanupTag);
+        }
+        if (this._deleteCommand === 'unlink' && typeof this._redis.unlink === 'function') {
+            return await this._redis.unlink(...keys);
+        }
+        return await this._redis.del(...keys);
     }
 
     private _normalizeRemainingTtl(ttl: number): CacheRemainingTtl | undefined {
@@ -138,8 +264,14 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         }
     }
 
-    async set(key: string, value: any, ttl?: number): Promise<void> {
+    async set(
+        key: string,
+        value: any,
+        ttl?: number,
+        options?: CacheSetOptions
+    ): Promise<void> {
         this._validateKey(key);
+        const tags = this._normalizeTags(options?.tags);
         const serialized = JSON.stringify(value);
         if (ttl !== undefined && ttl > 0) {
             // 使用 PX 选项（毫秒精度，对应 psetex 语义）
@@ -147,11 +279,11 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         } else {
             await this._redis.set(key, serialized);
         }
+        await this._replaceTagsForKey(key, tags ?? []);
     }
 
     async del(key: string): Promise<boolean> {
-        this._validateKey(key);
-        const result: number = await this._redis.del(key);
+        const result = await this._deleteKeys([key]);
         return result > 0;
     }
 
@@ -211,6 +343,9 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
             }
         }
         await pipeline.exec();
+        for (const key of keys) {
+            await this._replaceTagsForKey(key, []);
+        }
         return true;
     }
 
@@ -219,9 +354,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         if (keys.length === 0) {
             return 0;
         }
-        this._validateKeys(keys);
-        const result: number = await this._redis.del(...keys);
-        return result;
+        return this._deleteKeys(keys);
     }
 
     // ── 模式与键操作（A08：使用 SCAN，禁止 KEYS）──
@@ -237,15 +370,18 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
                 'MATCH',
                 redisPattern,
                 'COUNT',
-                SCAN_COUNT
+                this._scanCount
             );
             cursor = nextCursor;
 
             if (matchedKeys.length > 0) {
+                for (const key of matchedKeys) {
+                    await this._cleanupTagsForKey(key);
+                }
                 // 批量删除当前批次（pipeline 减少 RTT）
                 const pipeline = this._redis.pipeline();
                 for (const k of matchedKeys) {
-                    pipeline.del(k);
+                    this._deleteInPipeline(pipeline, k);
                 }
                 await pipeline.exec();
                 count += matchedKeys.length;
@@ -267,13 +403,47 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
                 'MATCH',
                 redisPattern,
                 'COUNT',
-                SCAN_COUNT
+                this._scanCount
             );
             cursor = nextCursor;
             result.push(...matchedKeys);
         } while (cursor !== '0');
 
         return result;
+    }
+
+    async invalidateByTag(tag: string): Promise<number> {
+        this._validateTag(tag);
+        const tagKey = this._tagKey(tag);
+        let cursor = '0';
+        let count = 0;
+
+        do {
+            const [nextCursor, keys]: [string, string[]] = await this._redis.sscan(
+                tagKey,
+                cursor,
+                'COUNT',
+                this._scanCount
+            );
+            cursor = nextCursor;
+
+            if (keys.length > 0) {
+                const existing: string[] = [];
+                for (const key of keys) {
+                    if (await this.exists(key)) {
+                        existing.push(key);
+                    } else {
+                        await this._cleanupTagsForKey(key, tag);
+                    }
+                }
+                if (existing.length > 0) {
+                    count += await this._deleteKeys(existing, tag);
+                }
+            }
+        } while (cursor !== '0');
+
+        await this._redis.del(tagKey);
+        return count;
     }
 
     async getRemainingTtl(key: string): Promise<CacheRemainingTtl | undefined> {
@@ -356,6 +526,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
  * @param urlOrInstance - Redis 连接 URL（字符串）或已有的 ioredis 实例（对象）
  *   - 传入字符串：adapter 自建连接，close() 会调用 redis.quit()
  *   - 传入对象：使用外部连接，close() 不操作（A17）
+ * @param options - Redis 适配器选项，包含 meta key 前缀、SCAN 数量和删除命令
  * @returns CacheLike 实现 + close() + getRedisInstance() 扩展
  *
  * @example
@@ -374,7 +545,8 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
  * ```
  */
 export function createRedisCacheAdapter(
-    urlOrInstance: string | object
+    urlOrInstance: string | object,
+    options?: RedisCacheAdapterOptions
 ): RedisCacheAdapter {
-    return new RedisCacheAdapterImpl(urlOrInstance);
+    return new RedisCacheAdapterImpl(urlOrInstance, options);
 }

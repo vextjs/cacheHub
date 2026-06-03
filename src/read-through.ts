@@ -5,7 +5,7 @@
  * 来源：技术方案 §5
  */
 
-import type { CacheLike } from './types.js';
+import type { CacheLease, CacheLeaseStore, CacheLike } from './types.js';
 
 // ── 模块级 inflight 表（跨实例共享，仅用于去重，不影响正确性）──
 const __inflight = new Map<string, Promise<any>>();
@@ -21,6 +21,82 @@ const INFLIGHT_MAX_SIZE = 10000;
  * 防止 fetcher 永久挂起导致后续请求永远复用同一个 rejected Promise
  */
 const INFLIGHT_TIMEOUT_MS = 300000;
+
+export interface ReadThroughWithLeaseOptions<T> {
+    cache: CacheLike;
+    ttlMs: number;
+    key: string;
+    fetcher: () => Promise<T>;
+    leaseStore: CacheLeaseStore;
+    /** Lease TTL. Defaults to min(ttlMs, 5000) with a lower bound of 50ms. */
+    leaseTtlMs?: number;
+    /** How long non-owner callers wait for the cache to be filled. Defaults to leaseTtlMs + 25ms. */
+    waitForOwnerMs?: number;
+    /** Poll interval while waiting for the owner to fill the cache. Defaults to 10ms. */
+    pollIntervalMs?: number;
+    /** When waiting times out, throw instead of executing the fetcher locally. */
+    onLeaseTimeout?: "fetch" | "throw";
+}
+
+function clampLeaseTtl(ttlMs: number, leaseTtlMs?: number): number {
+    if (leaseTtlMs !== undefined) {
+        return Math.max(1, Math.floor(leaseTtlMs));
+    }
+    return Math.max(50, Math.min(ttlMs, 5000));
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+            (timer as NodeJS.Timeout).unref();
+        }
+    });
+}
+
+async function waitForCachedValue<T>(
+    cache: CacheLike,
+    key: string,
+    waitMs: number,
+    pollIntervalMs: number
+): Promise<T | undefined> {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() <= deadline) {
+        const cached = await cache.get<T>(key);
+        if (cached !== undefined) {
+            return cached;
+        }
+        await sleep(pollIntervalMs);
+    }
+    return undefined;
+}
+
+async function writeFreshIfOwned<T>(
+    cache: CacheLike,
+    key: string,
+    ttlMs: number,
+    lease: CacheLease,
+    leaseTtlMs: number,
+    fetcher: () => Promise<T>
+): Promise<T> {
+    const cached = await cache.get<T>(key);
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    const fresh = await fetcher();
+    if (fresh !== undefined) {
+        try {
+            const stillOwner = await lease.renew(leaseTtlMs);
+            if (stillOwner) {
+                await cache.set(key, fresh, ttlMs);
+            }
+        } catch {
+            // Lease renewal or cache write failure should not hide a successful fetcher result.
+        }
+    }
+    return fresh;
+}
 
 /**
  * 读穿缓存：先查缓存，未命中则调用 fetcher，并发请求自动去重。
@@ -112,6 +188,111 @@ export async function readThrough<T>(
         // 放入 inflight 的新 Promise（极端并发 + fetcher 异常的罕见场景）。
         // 影响：仅降低去重效率（下一次请求重新触发 fetch），不影响数据正确性。
         __inflight.delete(key);
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * 读穿缓存 + 分布式 lease：用于多进程 / 多实例并发 miss 去重。
+ *
+ * - 进程内仍复用模块级 inflight，避免同一进程内重复争抢 Redis lease。
+ * - 只有拿到 lease 的调用者执行 fetcher 并写缓存。
+ * - 未拿到 lease 的调用者等待缓存被 owner 写入；超时后默认兜底 fetch。
+ */
+export async function readThroughWithLease<T>(
+    options: ReadThroughWithLeaseOptions<T>
+): Promise<T> {
+    const {
+        cache,
+        ttlMs,
+        key,
+        fetcher,
+        leaseStore,
+        onLeaseTimeout = "fetch",
+    } = options;
+
+    if (ttlMs <= 0) {
+        return fetcher();
+    }
+
+    const cached = await cache.get<T>(key);
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    const inflightKey = `lease:${key}`;
+    if (__inflight.has(inflightKey)) {
+        try {
+            return await (__inflight.get(inflightKey) as Promise<T>);
+        } catch {
+            // Fall through and attempt a fresh lease cycle.
+        }
+    }
+
+    if (__inflight.size >= INFLIGHT_MAX_SIZE) {
+        const toDelete = Math.ceil(__inflight.size * 0.1);
+        let count = 0;
+        for (const k of __inflight.keys()) {
+            if (count++ >= toDelete) {
+                break;
+            }
+            __inflight.delete(k);
+        }
+    }
+
+    const leaseTtlMs = clampLeaseTtl(ttlMs, options.leaseTtlMs);
+    const waitForOwnerMs = Math.max(0, Math.floor(options.waitForOwnerMs ?? leaseTtlMs + 25));
+    const pollIntervalMs = Math.max(1, Math.floor(options.pollIntervalMs ?? 10));
+
+    const p = (async (): Promise<T> => {
+        const lease = await leaseStore.acquireLease(key, leaseTtlMs);
+        if (lease) {
+            try {
+                return await writeFreshIfOwned(cache, key, ttlMs, lease, leaseTtlMs, fetcher);
+            } finally {
+                await lease.release().catch(() => false);
+            }
+        }
+
+        const filled = await waitForCachedValue<T>(
+            cache,
+            key,
+            waitForOwnerMs,
+            pollIntervalMs
+        );
+        if (filled !== undefined) {
+            return filled;
+        }
+
+        const retryLease = await leaseStore.acquireLease(key, leaseTtlMs);
+        if (retryLease) {
+            try {
+                return await writeFreshIfOwned(cache, key, ttlMs, retryLease, leaseTtlMs, fetcher);
+            } finally {
+                await retryLease.release().catch(() => false);
+            }
+        }
+
+        if (onLeaseTimeout === "throw") {
+            throw new Error(`[cache-hub] readThroughWithLease timeout for key: ${key}`);
+        }
+
+        return fetcher();
+    })();
+
+    __inflight.set(inflightKey, p);
+
+    const timer = setTimeout(() => {
+        __inflight.delete(inflightKey);
+    }, INFLIGHT_TIMEOUT_MS);
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+        (timer as NodeJS.Timeout).unref();
+    }
+
+    try {
+        return await p;
+    } finally {
+        __inflight.delete(inflightKey);
         clearTimeout(timer);
     }
 }

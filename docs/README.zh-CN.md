@@ -34,9 +34,10 @@
 - **LRU + TTL 内存缓存**：基于 O(1) 路径实现，支持条目数和估算内存双重限制。
 - **多级缓存**：L1 本地缓存加可选 L2 远端缓存，支持 TTL 保真回填、远端超时降级和可配置写策略。
 - **Redis 适配器**：将 ioredis 包装为 `CacheLike`；模式操作使用 SCAN，不使用生产环境高风险的 KEYS。
-- **读穿缓存**：未命中时执行 fetcher、写回缓存，并对同 key 并发请求做 in-flight 去重。
+- **读穿缓存**：未命中时执行 fetcher、写回缓存，并支持进程内去重与可选 Redis lease 去重。
 - **函数缓存**：通过 `withCache` 或 `FunctionCache` 缓存任意异步函数。
-- **分布式失效**：通过 Redis Pub/Sub 在多个服务实例之间广播缓存失效。
+- **标签失效**：内存、Redis、多级缓存与分布式失效器均支持按 tag 失效一组缓存。
+- **分布式失效**：通过 Redis Pub/Sub 在多个服务实例之间广播 pattern 与 tag 失效。
 - **稳定键序列化**：对象键排序、循环引用处理、特殊值哨兵，保证不同进程中的缓存键确定性。
 - **原子状态后端**：提供内存与 Redis 计数器原语，适合高并发状态更新。
 - **限流原语**：提供固定窗口、滑动窗口、token bucket、leaky bucket 状态存储，便于 HTTP middleware 作者接入。
@@ -97,6 +98,34 @@ const user = await readThrough(cache, 30_000, 'user:1', async () => {
 
 `readThrough` 命中缓存时直接返回；未命中时执行 fetcher，将非 `undefined` 结果写回缓存，并让同 key 并发调用共享同一个 Promise。
 
+### Redis lease 读穿缓存
+
+当多个 Node.js 进程可能同时未命中同一个 key 时，使用 `readThroughWithLease`。一个进程拿到 Redis lease 后执行 fetcher；其他进程短暂等待缓存被填充。
+
+```typescript
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+import { createRedisLeaseStore } from 'cache-hub/lease';
+import { readThroughWithLease } from 'cache-hub/read-through';
+
+const cache = createRedisCacheAdapter('redis://localhost:6379');
+const leaseStore = createRedisLeaseStore(cache);
+
+const value = await readThroughWithLease({
+    cache,
+    ttlMs: 2_000,
+    key: 'response:/users/1',
+    leaseStore,
+    leaseTtlMs: 1_000,
+    waitForOwnerMs: 1_200,
+    pollIntervalMs: 10,
+    fetcher: async () => renderExpensiveResponse(),
+});
+
+await cache.close();
+```
+
+默认 `onLeaseTimeout: 'fetch'`，即等待 owner 超时后当前调用会自己回源，优先保证可用性。如果业务不允许重复回源，可设置 `onLeaseTimeout: 'throw'`。
+
 ### 函数缓存
 
 ```typescript
@@ -146,6 +175,34 @@ console.log(product?.name); // Keyboard
 await remote.close();
 ```
 
+### 标签失效
+
+tag 适合在不知道完整 key 列表时按业务分组清理缓存。
+
+```typescript
+import { MemoryCache } from 'cache-hub';
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+
+const memory = new MemoryCache({ enableTags: true });
+await memory.set('user:1:profile', { name: 'Alice' }, 60_000, {
+    tags: ['user:1', 'tenant:a'],
+});
+await memory.invalidateByTag('user:1');
+
+const redis = createRedisCacheAdapter('redis://localhost:6379', {
+    metaKeyPrefix: 'my-app:cache-meta',
+    deleteCommand: 'unlink',
+});
+await redis.set('user:1:profile', { name: 'Alice' }, 60_000, {
+    tags: ['user:1', 'tenant:a'],
+});
+const deleted = await redis.invalidateByTag('tenant:a');
+
+await redis.close();
+```
+
+再次调用 `set(key, value, ttl)` 且不传 tags 时，会清理同一个 key 的旧 tag 关系，避免旧 tag 误删后写入的新值。
+
 ### 分布式失效
 
 ```typescript
@@ -161,10 +218,11 @@ const invalidator = new DistributedCacheInvalidator({
 });
 
 await invalidator.invalidate('user:*');
+await invalidator.invalidateTag('tenant:a');
 await invalidator.close();
 ```
 
-调用 `invalidate(pattern)` 时，当前实例会先失效本地缓存，再把同一个 pattern 广播给其他订阅实例。
+调用 `invalidate(pattern)` 时，当前实例会先失效本地缓存，再把同一个 pattern 广播给其他订阅实例。`invalidateTag(tag)` 对支持 `invalidateByTag` 的缓存执行同样流程。
 
 ### 固定窗口限流存储
 
@@ -247,7 +305,7 @@ import type { CacheLike, CacheStats, MemoryCacheOptions } from 'cache-hub';
 ```typescript
 interface CacheLike {
     get<T = any>(key: string): T | undefined | Promise<T | undefined>;
-    set(key: string, value: any, ttl?: number): void | Promise<void>;
+    set(key: string, value: any, ttl?: number, options?: CacheSetOptions): void | Promise<void>;
     del(key: string): boolean | Promise<boolean>;
     exists(key: string): boolean | Promise<boolean>;
     has(key: string): boolean | Promise<boolean>;
@@ -259,7 +317,7 @@ interface CacheLike {
     delPattern(pattern: string): number | Promise<number>;
     getRemainingTtl?(key: string): number | null | undefined | Promise<number | null | undefined>;
     getRemainingTtlMany?(keys: string[]): Record<string, number | null> | Promise<Record<string, number | null>>;
-    invalidateByTag?(tag: string): void | Promise<void>;
+    invalidateByTag?(tag: string): void | number | Promise<void | number>;
     getStats?(): CacheStats;
     resetStats?(): void;
     destroy?(): void;
@@ -270,7 +328,7 @@ interface CacheLike {
 ### `cache-hub/read-through`
 
 ```typescript
-import { readThrough } from 'cache-hub/read-through';
+import { readThrough, readThroughWithLease } from 'cache-hub/read-through';
 
 function readThrough<V>(
     cache: CacheLike,
@@ -284,6 +342,21 @@ function readThrough<V>(
 - `null` 是合法缓存值，会写入缓存。
 - `undefined` 是未命中信号，不会写入缓存。
 - 同 key 并发调用共享一个 in-flight Promise。
+- `readThroughWithLease(options)` 通过 `CacheLeaseStore` 支持跨进程去重，适合短 TTL 响应缓存过期后多个 worker 同时回源的场景。
+
+`readThroughWithLease` 配置：
+
+| 选项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `cache` | `CacheLike` | 必填 | 读取与写入的缓存实例。 |
+| `key` | `string` | 必填 | 缓存 key，同时也是 lease 资源 key。 |
+| `ttlMs` | `number` | 必填 | 缓存 TTL，单位毫秒；`<= 0` 时绕过缓存和 lease。 |
+| `fetcher` | `() => Promise<T>` | 必填 | 未命中时执行的回源函数。 |
+| `leaseStore` | `CacheLeaseStore` | 必填 | lease 存储，通常由 `createRedisLeaseStore` 创建。 |
+| `leaseTtlMs` | `number` | `min(ttlMs, 5000)`，最小 `50` | lease 有效期，应略长于正常 fetch 耗时。 |
+| `waitForOwnerMs` | `number` | `leaseTtlMs + 25` | 未拿到 lease 的调用等待 owner 写入缓存的时间。 |
+| `pollIntervalMs` | `number` | `10` | 等待期间轮询缓存的间隔。 |
+| `onLeaseTimeout` | `'fetch' \| 'throw'` | `'fetch'` | 等待超时后的兜底策略。 |
 
 ### `cache-hub/multi-level`
 
@@ -301,6 +374,7 @@ new MultiLevelCache(options);
 | `backfillOnRemoteHit` | `boolean` | `true` | L2 命中后回填 L1；远端支持 TTL 查询时保留剩余 TTL。 |
 | `remoteTimeoutMs` | `number` | `50` | L2 get 超时时间，超时后按 L1 未命中降级。 |
 | `publish` | `(msg) => void` | `undefined` | 可选分布式失效消息回调。 |
+| `remoteInvalidationErrors` | `'ignore' \| 'throw'` | `'ignore'` | L2 `invalidateByTag` 失败时忽略还是向调用方抛出。 |
 
 ### `cache-hub/redis`
 
@@ -310,16 +384,43 @@ import { createRedisCacheAdapter } from 'cache-hub/redis';
 const adapter = createRedisCacheAdapter('redis://localhost:6379');
 ```
 
+配置项：
+
+| 选项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `metaKeyPrefix` | `string` | `__cache-hub` | Redis tag 元数据 key 前缀。多个应用共用同一个 Redis DB 时建议设置应用级前缀。 |
+| `scanCount` | `number` | `100` | SCAN / SSCAN 的 count hint，必须为正数。 |
+| `deleteCommand` | `'del' \| 'unlink'` | `'del'` | 大 value 删除场景可选 `unlink`，让 Redis 异步释放内存。 |
+
 Redis adapter 实现 `CacheLike`，并额外提供：
 
 | 方法 | 说明 |
 |---|---|
 | `getRemainingTtl(key)` | 返回剩余 TTL 毫秒数；不过期 key 返回 `null`，不存在 key 返回 `undefined`。 |
 | `getRemainingTtlMany(keys)` | 批量查询 TTL。 |
+| `invalidateByTag(tag)` | 删除绑定该 tag 的业务缓存 key，并返回删除数量。 |
 | `close()` | 只关闭 adapter 自己创建的连接；外部传入的 ioredis 实例不会被关闭。 |
 | `getRedisInstance()` | 返回底层 ioredis 实例，供高级场景使用。 |
 
 模式操作使用 `SCAN COUNT 100`，不会使用 `KEYS`。
+
+### `cache-hub/lease`
+
+```typescript
+import { createRedisLeaseStore } from 'cache-hub/lease';
+
+const leaseStore = createRedisLeaseStore(redisCacheOrIoredis, {
+    leaseKeyPrefix: 'my-app:cache-lease',
+    ownerId: 'api-worker-1',
+});
+```
+
+| 选项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `leaseKeyPrefix` | `string` | `__cache-hub:lease` | Redis lease key 前缀。 |
+| `ownerId` | `string` | 随机 UUID | 写入 lease token 的 owner 前缀，便于区分实例。 |
+
+Redis lease store 使用 `SET key token NX PX ttlMs` 获取 lease，并使用 Lua 脚本保证只有 token 匹配的持有者才能释放或续租。
 
 ### `cache-hub/function-cache`
 
@@ -352,11 +453,19 @@ const invalidator = new DistributedCacheInvalidator({
 
 | 选项 | 说明 |
 |---|---|
-| `cache` | 必填，收到失效消息时调用该实例的 `delPattern(pattern)`。 |
+| `cache` | 必填，收到 pattern 消息时调用 `delPattern(pattern)`；收到 tag 消息时调用 `invalidateByTag(tag)`。 |
 | `redisUrl` | Redis URL；未传 `redisUrl` 或 `redis` 时默认 `redis://localhost:6379`。 |
 | `redis` | 已有 ioredis 实例，用作发布连接。 |
 | `channel` | Pub/Sub 频道，默认 `cache-hub:invalidate`。 |
 | `instanceId` | 当前实例 ID，用于过滤自身消息。 |
+
+方法：
+
+| 方法 | 说明 |
+|---|---|
+| `invalidate(pattern)` | 当前实例先执行 `delPattern(pattern)`，再广播向后兼容的 pattern 消息。 |
+| `invalidatePattern(pattern)` | `invalidate(pattern)` 的语义化别名。 |
+| `invalidateTag(tag)` | 当前实例先执行 `invalidateByTag(tag)`，再广播 tag 消息。 |
 
 ### `cache-hub/atomic`
 
@@ -519,6 +628,9 @@ dist/
 | Redis 鉴权失败 | 使用 `redis://:password@host:6379`，或传入已配置好的 ioredis 实例。 |
 | 模式删除比预期慢 | `delPattern` 与 `keys` 为安全使用 SCAN，避免 KEYS 阻塞 Redis。 |
 | 存入 `undefined` 后仍像未命中 | `undefined` 是未命中信号；需要缓存空结果时请使用 `null` 或哨兵对象。 |
+| tag 失效没有删除 Redis 缓存 | 确认写入时使用了 `set(key, value, ttl, { tags })`，并且所有实例使用相同 `metaKeyPrefix`。 |
+| 过期 Redis key 仍留在 tag 元数据中 | 这是预期行为；`invalidateByTag` 扫描 tag 时会惰性清理 stale member。 |
+| 短 TTL 过期后回源次数过多 | 使用 `readThroughWithLease` 与 Redis lease store，并让 `leaseTtlMs` 略长于正常 fetch 耗时。 |
 
 ---
 

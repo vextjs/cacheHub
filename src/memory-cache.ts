@@ -12,6 +12,7 @@
 import type {
   CacheLike,
   CacheRemainingTtl,
+  CacheSetOptions,
   CacheStats,
   LockManager,
   MemoryCacheOptions,
@@ -27,10 +28,8 @@ interface InternalEntry<V = any> {
   tags: string[]; // enableTags=true 时使用
 }
 
-/** set() 方法的扩展选项（不在 CacheLike 接口中，仅 MemoryCache 支持） */
-export interface SetOptions {
-  tags?: string[];
-}
+/** set() 方法的扩展选项。保留旧名称以兼容既有导入。 */
+export type SetOptions = CacheSetOptions;
 
 /** 内部统计计数器（仅追踪增量，不含计算字段） */
 interface StatsCounters {

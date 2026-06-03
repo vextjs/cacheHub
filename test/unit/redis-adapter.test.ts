@@ -16,15 +16,21 @@ vi.mock("module", async (importOriginal) => {
     get = vi.fn<[string], Promise<null>>().mockResolvedValue(null);
     set = vi.fn().mockResolvedValue("OK");
     del = vi.fn().mockResolvedValue(1);
+    unlink = vi.fn().mockResolvedValue(1);
     exists = vi.fn().mockResolvedValue(0);
     pttl = vi.fn().mockResolvedValue(-2);
     flushdb = vi.fn().mockResolvedValue("OK");
     mget = vi.fn().mockResolvedValue([]);
+    smembers = vi.fn().mockResolvedValue([]);
+    sscan = vi.fn().mockResolvedValue(["0", []]);
     scan = vi.fn().mockResolvedValue(["0", []]);
     pipeline = vi.fn().mockReturnValue({
       set: vi.fn().mockReturnThis(),
       del: vi.fn().mockReturnThis(),
+      unlink: vi.fn().mockReturnThis(),
       pttl: vi.fn().mockReturnThis(),
+      sadd: vi.fn().mockReturnThis(),
+      srem: vi.fn().mockReturnThis(),
       exec: vi.fn().mockResolvedValue([]),
     });
     quit = vi.fn().mockResolvedValue("OK");
@@ -55,7 +61,10 @@ function makeMockRedis() {
   const pipelineMock = {
     set: vi.fn().mockReturnThis(),
     del: vi.fn().mockReturnThis(),
+    unlink: vi.fn().mockReturnThis(),
     pttl: vi.fn().mockReturnThis(),
+    sadd: vi.fn().mockReturnThis(),
+    srem: vi.fn().mockReturnThis(),
     exec: vi.fn().mockResolvedValue([]),
   };
 
@@ -63,10 +72,13 @@ function makeMockRedis() {
     get: vi.fn(),
     set: vi.fn().mockResolvedValue("OK"),
     del: vi.fn().mockResolvedValue(0),
+    unlink: vi.fn().mockResolvedValue(0),
     exists: vi.fn().mockResolvedValue(0),
     pttl: vi.fn().mockResolvedValue(-2),
     flushdb: vi.fn().mockResolvedValue("OK"),
     mget: vi.fn().mockResolvedValue([]),
+    smembers: vi.fn().mockResolvedValue([]),
+    sscan: vi.fn().mockResolvedValue(["0", []]),
     pipeline: vi.fn().mockReturnValue(pipelineMock),
     scan: vi.fn().mockResolvedValue(["0", []]),
     quit: vi.fn().mockResolvedValue("OK"),
@@ -199,6 +211,69 @@ describe("RedisCacheAdapter", () => {
     it("key 为空字符串时抛出 TypeError（A12）", async () => {
       const { adapter } = makeAdapter();
       await expect(adapter.set("", "v")).rejects.toThrow(TypeError);
+    });
+
+    it("set 带 tags 时写入 tag 索引和 key-tags 反向索引", async () => {
+      const { adapter, redis } = makeAdapter();
+
+      await adapter.set("k", "v", 1000, { tags: ["user", "tenant"] });
+
+      expect(redis._pipeline.sadd).toHaveBeenCalledWith(
+        expect.stringContaining(":tag:"),
+        "k",
+      );
+      expect(redis._pipeline.sadd).toHaveBeenCalledWith(
+        expect.stringContaining(":key-tags:"),
+        "user",
+        "tenant",
+      );
+      expect(redis._pipeline.exec).toHaveBeenCalledOnce();
+    });
+
+    it("set 去重 tags，并拒绝空 tag", async () => {
+      const { adapter, redis } = makeAdapter();
+
+      await adapter.set("k", "v", 1000, { tags: ["user", "user"] });
+      expect(redis._pipeline.sadd).toHaveBeenCalledWith(
+        expect.stringContaining(":key-tags:"),
+        "user",
+      );
+
+      await expect(adapter.set("k", "v", 1000, { tags: [""] })).rejects.toThrow(
+        TypeError,
+      );
+    });
+
+    it("tags 不是数组时抛出 TypeError", async () => {
+      const { adapter } = makeAdapter();
+      await expect(
+        adapter.set("k", "v", 1000, { tags: "bad" as any }),
+      ).rejects.toThrow(TypeError);
+    });
+
+    it("无 tags 覆写会清理旧 tag 索引，避免 stale tag 误删新值", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.smembers.mockResolvedValueOnce(["old-tag"]);
+
+      await adapter.set("k", "new-value");
+
+      expect(redis._pipeline.srem).toHaveBeenCalledWith(
+        expect.stringContaining(":tag:"),
+        "k",
+      );
+      expect(redis._pipeline.del).toHaveBeenCalledWith(
+        expect.stringContaining(":key-tags:"),
+      );
+    });
+
+    it("底层客户端不支持 smembers 时仍能执行无 tag set", async () => {
+      const redis = makeMockRedis();
+      delete (redis as any).smembers;
+      const adapter = createRedisCacheAdapter(redis as any);
+
+      await adapter.set("k", "v");
+
+      expect(redis.set).toHaveBeenCalledWith("k", '"v"');
     });
   });
 
@@ -453,6 +528,33 @@ describe("RedisCacheAdapter", () => {
       expect(redis._pipeline.exec).toHaveBeenCalledOnce();
     });
 
+    it("deleteCommand=unlink 时使用 UNLINK 删除匹配键", async () => {
+      const redis = makeMockRedis();
+      const adapter = createRedisCacheAdapter(redis as any, {
+        deleteCommand: "unlink",
+      });
+      redis.scan.mockResolvedValue(["0", ["k:1", "k:2"]]);
+
+      await adapter.delPattern("k:*");
+
+      expect(redis._pipeline.unlink).toHaveBeenCalledWith("k:1");
+      expect(redis._pipeline.unlink).toHaveBeenCalledWith("k:2");
+      expect(redis._pipeline.del).not.toHaveBeenCalledWith("k:1");
+    });
+
+    it("deleteCommand=unlink 但 pipeline 不支持 unlink 时回退 DEL", async () => {
+      const redis = makeMockRedis();
+      delete (redis._pipeline as any).unlink;
+      const adapter = createRedisCacheAdapter(redis as any, {
+        deleteCommand: "unlink",
+      });
+      redis.scan.mockResolvedValue(["0", ["k:1"]]);
+
+      await adapter.delPattern("k:*");
+
+      expect(redis._pipeline.del).toHaveBeenCalledWith("k:1");
+    });
+
     it("pattern 超过 512 字符时截断并打印 warn（A10）", async () => {
       const { adapter, redis } = makeAdapter();
       redis.scan.mockResolvedValue(["0", []]);
@@ -537,6 +639,27 @@ describe("RedisCacheAdapter", () => {
       redis.scan.mockResolvedValue(["0", []]);
       expect(await adapter.keys("nonexistent:*")).toEqual([]);
     });
+
+    it("自定义 scanCount 会传递给 SCAN", async () => {
+      const redis = makeMockRedis();
+      const adapter = createRedisCacheAdapter(redis as any, { scanCount: 7 });
+
+      await adapter.keys("k:*");
+
+      expect(redis.scan).toHaveBeenCalledWith(
+        "0",
+        "MATCH",
+        "k:*",
+        "COUNT",
+        7,
+      );
+    });
+
+    it("非法 scanCount 抛出 RangeError", () => {
+      expect(() =>
+        createRedisCacheAdapter(makeMockRedis() as any, { scanCount: 0 }),
+      ).toThrow(RangeError);
+    });
   });
 
   describe("getRemainingTtl", () => {
@@ -603,6 +726,87 @@ describe("RedisCacheAdapter", () => {
       await expect(adapter.getRemainingTtlMany!([""])).rejects.toThrow(
         TypeError,
       );
+    });
+  });
+
+  describe("invalidateByTag", () => {
+    it("按 tag 使用 SSCAN 找到 key，并删除存在的 key", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.sscan.mockResolvedValue(["0", ["k1", "k2"]]);
+      redis.exists.mockResolvedValue(1);
+      redis.del.mockResolvedValue(2);
+
+      const count = await adapter.invalidateByTag("user");
+
+      expect(count).toBe(2);
+      expect(redis.sscan).toHaveBeenCalledWith(
+        expect.stringContaining(":tag:"),
+        "0",
+        "COUNT",
+        100,
+      );
+      expect(redis.del).toHaveBeenCalledWith("k1", "k2");
+      expect(redis.del).toHaveBeenCalledWith(expect.stringContaining(":tag:"));
+    });
+
+    it("invalidateByTag 会清理已过期 key 的反向索引", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.sscan.mockResolvedValue(["0", ["stale"]]);
+      redis.exists.mockResolvedValue(0);
+      redis.smembers.mockResolvedValueOnce(["user", "tenant"]);
+
+      const count = await adapter.invalidateByTag("user");
+
+      expect(count).toBe(0);
+      expect(redis._pipeline.srem).toHaveBeenCalledWith(
+        expect.stringContaining(":tag:"),
+        "stale",
+      );
+      expect(
+        redis._pipeline.srem.mock.calls.some(
+          ([tagKey]) => tagKey === redis.sscan.mock.calls[0][0],
+        ),
+      ).toBe(false);
+      expect(redis._pipeline.del).toHaveBeenCalledWith(
+        expect.stringContaining(":key-tags:"),
+      );
+    });
+
+    it("invalidateByTag 支持多批次 SSCAN", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.sscan
+        .mockResolvedValueOnce(["7", ["k1"]])
+        .mockResolvedValueOnce(["0", ["k2"]]);
+      redis.exists.mockResolvedValue(1);
+      redis.del.mockResolvedValue(1);
+
+      expect(await adapter.invalidateByTag("user")).toBe(2);
+      expect(redis.sscan).toHaveBeenCalledTimes(2);
+    });
+
+    it("空 tag 抛出 TypeError", async () => {
+      const { adapter } = makeAdapter();
+      await expect(adapter.invalidateByTag("")).rejects.toThrow(TypeError);
+    });
+
+    it("deleteCommand=unlink 时批量删除 tag 命中的 key 使用 UNLINK", async () => {
+      const redis = makeMockRedis();
+      const adapter = createRedisCacheAdapter(redis as any, {
+        deleteCommand: "unlink",
+      });
+      redis.sscan.mockResolvedValue(["0", ["k1"]]);
+      redis.exists.mockResolvedValue(1);
+      redis.unlink.mockResolvedValue(1);
+
+      expect(await adapter.invalidateByTag("user")).toBe(1);
+      expect(redis.unlink).toHaveBeenCalledWith("k1");
+    });
+
+    it("内部 _deleteKeys 对空数组快速返回 0", async () => {
+      const { adapter, redis } = makeAdapter();
+
+      expect(await (adapter as any)._deleteKeys([])).toBe(0);
+      expect(redis.del).not.toHaveBeenCalled();
     });
   });
 

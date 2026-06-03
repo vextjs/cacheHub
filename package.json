@@ -1,6 +1,6 @@
 {
   "name": "cache-hub",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "types": "./dist/types/index.d.ts",
@@ -69,6 +69,11 @@
       "import": "./dist/esm/read-through.js",
       "require": "./dist/cjs/read-through.js"
     },
+    "./lease": {
+      "types": "./dist/types/redis-lease.d.ts",
+      "import": "./dist/esm/redis-lease.js",
+      "require": "./dist/cjs/redis-lease.js"
+    },
     "./atomic": {
       "types": "./dist/types/atomic.d.ts",
       "import": "./dist/esm/atomic.js",
@@ -124,6 +129,6 @@
     "build:cjs": "node scripts/build-cjs.mjs",
     "benchmark": "npm run build && node scripts/benchmark.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run build"
+    "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run test:integration && npm run build"
   }
 }

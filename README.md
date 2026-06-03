@@ -37,9 +37,10 @@ Chinese documentation: [docs/README.zh-CN.md](./docs/README.zh-CN.md)
 - **Memory cache with LRU + TTL** - O(1) operations with entry-count and memory-size limits.
 - **Multi-level cache** - L1 memory plus optional L2 remote cache, TTL-preserving backfill, timeout fallback, and configurable write policy.
 - **Redis adapter** - wraps ioredis as `CacheLike`; uses SCAN instead of KEYS for production-safe pattern operations.
-- **Read-through caching** - cache miss fetch, write-back, and in-flight request de-duplication.
+- **Read-through caching** - cache miss fetch, write-back, in-process de-duplication, and optional Redis lease de-duplication.
 - **Function cache** - cache any async function with `withCache` or the `FunctionCache` registry.
-- **Distributed invalidation** - Redis Pub/Sub broadcasts cache invalidation across service instances.
+- **Tag invalidation** - memory, Redis, multi-level, and distributed tag invalidation for grouped cache entries.
+- **Distributed invalidation** - Redis Pub/Sub broadcasts pattern and tag invalidation across service instances.
 - **Stable key serialization** - deterministic cache keys with sorted object keys, cycle handling, and special value sentinels.
 - **Atomic state backends** - memory and Redis counter primitives for high-concurrency state updates.
 - **Rate-limit primitives** - fixed-window, sliding-window, token-bucket, and leaky-bucket state stores for middleware authors.
@@ -103,6 +104,38 @@ const user = await readThrough(cache, 30_000, 'user:1', async () => {
 fetcher, writes non-`undefined` results back to cache, and shares one in-flight
 promise for concurrent calls with the same key.
 
+### Read-through with Redis Lease
+
+Use `readThroughWithLease` when many Node.js processes may miss the same key at
+the same time. One process acquires the Redis lease and runs the fetcher; other
+processes wait briefly for the cache to be filled.
+
+```typescript
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+import { createRedisLeaseStore } from 'cache-hub/lease';
+import { readThroughWithLease } from 'cache-hub/read-through';
+
+const cache = createRedisCacheAdapter('redis://localhost:6379');
+const leaseStore = createRedisLeaseStore(cache);
+
+const value = await readThroughWithLease({
+    cache,
+    ttlMs: 2_000,
+    key: 'response:/users/1',
+    leaseStore,
+    leaseTtlMs: 1_000,
+    waitForOwnerMs: 1_200,
+    pollIntervalMs: 10,
+    fetcher: async () => renderExpensiveResponse(),
+});
+
+await cache.close();
+```
+
+The default timeout behavior is `onLeaseTimeout: 'fetch'`, which favors
+availability. Use `onLeaseTimeout: 'throw'` if duplicate origin fetches must be
+rejected instead of allowed.
+
 ### Function Cache
 
 ```typescript
@@ -153,6 +186,36 @@ console.log(product?.name); // Keyboard
 await remote.close();
 ```
 
+### Tags
+
+Tags let you invalidate a group of cache entries without knowing every cache
+key at call time.
+
+```typescript
+import { MemoryCache } from 'cache-hub';
+import { createRedisCacheAdapter } from 'cache-hub/redis';
+
+const memory = new MemoryCache({ enableTags: true });
+await memory.set('user:1:profile', { name: 'Alice' }, 60_000, {
+    tags: ['user:1', 'tenant:a'],
+});
+await memory.invalidateByTag('user:1');
+
+const redis = createRedisCacheAdapter('redis://localhost:6379', {
+    metaKeyPrefix: 'my-app:cache-meta',
+    deleteCommand: 'unlink',
+});
+await redis.set('user:1:profile', { name: 'Alice' }, 60_000, {
+    tags: ['user:1', 'tenant:a'],
+});
+const deleted = await redis.invalidateByTag('tenant:a');
+
+await redis.close();
+```
+
+`set(key, value, ttl)` without tags clears any previous tag relationship for the
+same key. This prevents an old tag from deleting a newer untagged value.
+
 ### Distributed Invalidation
 
 ```typescript
@@ -168,11 +231,13 @@ const invalidator = new DistributedCacheInvalidator({
 });
 
 await invalidator.invalidate('user:*');
+await invalidator.invalidateTag('tenant:a');
 await invalidator.close();
 ```
 
 Calling `invalidate(pattern)` first invalidates the current instance and then
-broadcasts the same pattern to other subscribers.
+broadcasts the same pattern to other subscribers. `invalidateTag(tag)` does the
+same for caches that support `invalidateByTag`.
 
 ### Fixed-window Rate-limit Store
 
@@ -260,7 +325,7 @@ Every cache implementation can be used through this interface:
 ```typescript
 interface CacheLike {
     get<T = any>(key: string): T | undefined | Promise<T | undefined>;
-    set(key: string, value: any, ttl?: number): void | Promise<void>;
+    set(key: string, value: any, ttl?: number, options?: CacheSetOptions): void | Promise<void>;
     del(key: string): boolean | Promise<boolean>;
     exists(key: string): boolean | Promise<boolean>;
     has(key: string): boolean | Promise<boolean>;
@@ -272,7 +337,7 @@ interface CacheLike {
     delPattern(pattern: string): number | Promise<number>;
     getRemainingTtl?(key: string): number | null | undefined | Promise<number | null | undefined>;
     getRemainingTtlMany?(keys: string[]): Record<string, number | null> | Promise<Record<string, number | null>>;
-    invalidateByTag?(tag: string): void | Promise<void>;
+    invalidateByTag?(tag: string): void | number | Promise<void | number>;
     getStats?(): CacheStats;
     resetStats?(): void;
     destroy?(): void;
@@ -283,7 +348,7 @@ interface CacheLike {
 ### `cache-hub/read-through`
 
 ```typescript
-import { readThrough } from 'cache-hub/read-through';
+import { readThrough, readThroughWithLease } from 'cache-hub/read-through';
 
 function readThrough<V>(
     cache: CacheLike,
@@ -297,6 +362,23 @@ function readThrough<V>(
 - `null` is cached as a valid value.
 - `undefined` is treated as a miss signal and is not cached.
 - Same-key concurrent calls share one in-flight promise.
+- `readThroughWithLease(options)` adds a `CacheLeaseStore` for cross-process
+  de-duplication. It is useful for short TTL response cache entries that may be
+  regenerated by many workers at once.
+
+`readThroughWithLease` options:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `cache` | `CacheLike` | required | Cache to read from and write to. |
+| `key` | `string` | required | Cache key and lease resource key. |
+| `ttlMs` | `number` | required | Cache TTL in milliseconds. `<= 0` bypasses cache and lease. |
+| `fetcher` | `() => Promise<T>` | required | Origin function used on miss. |
+| `leaseStore` | `CacheLeaseStore` | required | Lease store, usually created with `createRedisLeaseStore`. |
+| `leaseTtlMs` | `number` | `min(ttlMs, 5000)`, at least `50` | Lease lifetime. Keep it longer than the normal fetch latency. |
+| `waitForOwnerMs` | `number` | `leaseTtlMs + 25` | How long non-owner callers wait for cache fill. |
+| `pollIntervalMs` | `number` | `10` | Cache polling interval while waiting. |
+| `onLeaseTimeout` | `'fetch' \| 'throw'` | `'fetch'` | Fallback behavior when no owner fills the cache in time. |
 
 ### `cache-hub/multi-level`
 
@@ -314,6 +396,7 @@ new MultiLevelCache(options);
 | `backfillOnRemoteHit` | `boolean` | `true` | Backfills L1 after L2 hit. Preserves remote TTL when supported. |
 | `remoteTimeoutMs` | `number` | `50` | L2 get timeout in milliseconds. Timeout falls back to L1 miss behavior. |
 | `publish` | `(msg) => void` | `undefined` | Optional callback for distributed invalidation messages. |
+| `remoteInvalidationErrors` | `'ignore' \| 'throw'` | `'ignore'` | Controls whether remote `invalidateByTag` errors are swallowed or rethrown. |
 
 ### `cache-hub/redis`
 
@@ -323,16 +406,44 @@ import { createRedisCacheAdapter } from 'cache-hub/redis';
 const adapter = createRedisCacheAdapter('redis://localhost:6379');
 ```
 
+Options:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `metaKeyPrefix` | `string` | `__cache-hub` | Prefix for Redis tag metadata keys. Use an app-specific prefix when several apps share a Redis database. |
+| `scanCount` | `number` | `100` | SCAN / SSCAN count hint. Must be positive. |
+| `deleteCommand` | `'del' \| 'unlink'` | `'del'` | Use `unlink` for asynchronous Redis memory reclamation on large values. |
+
 The Redis adapter implements `CacheLike` and adds:
 
 | Method | Description |
 |---|---|
 | `getRemainingTtl(key)` | Returns remaining TTL in milliseconds, `null` for non-expiring keys, and `undefined` for missing keys. |
 | `getRemainingTtlMany(keys)` | Batch TTL lookup. |
+| `invalidateByTag(tag)` | Deletes cache entries attached to a tag and returns the number of deleted business keys. |
 | `close()` | Closes only the connection created by the adapter. Externally supplied ioredis instances are not closed. |
 | `getRedisInstance()` | Returns the underlying ioredis instance for advanced use cases. |
 
 Pattern operations use `SCAN` with `COUNT 100`; `KEYS` is not used.
+
+### `cache-hub/lease`
+
+```typescript
+import { createRedisLeaseStore } from 'cache-hub/lease';
+
+const leaseStore = createRedisLeaseStore(redisCacheOrIoredis, {
+    leaseKeyPrefix: 'my-app:cache-lease',
+    ownerId: 'api-worker-1',
+});
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `leaseKeyPrefix` | `string` | `__cache-hub:lease` | Prefix for Redis lease keys. |
+| `ownerId` | `string` | random UUID | Stable owner prefix included in lease tokens. |
+
+The Redis lease store uses `SET key token NX PX ttlMs` to acquire a lease and Lua
+scripts to release or renew only when the token still matches.
 
 ### `cache-hub/function-cache`
 
@@ -367,11 +478,19 @@ const invalidator = new DistributedCacheInvalidator({
 
 | Option | Description |
 |---|---|
-| `cache` | Required cache instance that receives `delPattern(pattern)` calls. |
+| `cache` | Required cache instance that receives `delPattern(pattern)` and, for tag messages, `invalidateByTag(tag)` calls. |
 | `redisUrl` | Redis URL. Defaults to `redis://localhost:6379` when neither `redisUrl` nor `redis` is provided. |
 | `redis` | Existing ioredis instance used for publishing. |
 | `channel` | Pub/Sub channel. Defaults to `cache-hub:invalidate`. |
 | `instanceId` | Unique instance id used to filter self-sent messages. |
+
+Methods:
+
+| Method | Description |
+|---|---|
+| `invalidate(pattern)` | Invalidates the current instance with `delPattern(pattern)` and broadcasts a backward-compatible pattern message. |
+| `invalidatePattern(pattern)` | Alias for `invalidate(pattern)`. |
+| `invalidateTag(tag)` | Invalidates the current instance with `invalidateByTag(tag)` and broadcasts a tag message. |
 
 ### `cache-hub/atomic`
 
@@ -543,6 +662,9 @@ public subpath export.
 | Redis auth fails | Use `redis://:password@host:6379` or pass an already configured ioredis instance. |
 | Pattern deletes are slower than expected | `delPattern` and `keys` use SCAN for safety; this avoids blocking Redis like KEYS. |
 | Cache misses after storing `undefined` | `undefined` is the miss signal. Use `null` or a sentinel object for cacheable empty results. |
+| Tag invalidation does not remove Redis entries | Confirm entries were written with `set(key, value, ttl, { tags })` and that all instances use the same `metaKeyPrefix`. |
+| Expired Redis keys still appear in tag metadata | This is expected; `invalidateByTag` cleans stale members lazily while scanning the tag. |
+| Too many origin fetches after short TTL expiry | Use `readThroughWithLease` with a Redis lease store and set `leaseTtlMs` longer than normal fetch latency. |
 
 ---
 

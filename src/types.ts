@@ -15,10 +15,17 @@
  */
 export type CacheRemainingTtl = number | null;
 
+/**
+ * 单键 set() 的扩展选项。
+ */
+export interface CacheSetOptions {
+    tags?: string[];
+}
+
 export interface CacheLike {
     // ── 核心 CRUD（6 方法）──
     get<T = any>(key: string): T | undefined | Promise<T | undefined>;
-    set(key: string, value: any, ttl?: number): void | Promise<void>;
+    set(key: string, value: any, ttl?: number, options?: CacheSetOptions): void | Promise<void>;
     del(key: string): boolean | Promise<boolean>;
     exists(key: string): boolean | Promise<boolean>;
     has(key: string): boolean | Promise<boolean>;        // exists 别名（schema-dsl 使用）
@@ -51,7 +58,7 @@ export interface CacheLike {
      * - 值为 `null`：存在且永不过期
      */
     getRemainingTtlMany?(keys: string[]): Record<string, CacheRemainingTtl> | Promise<Record<string, CacheRemainingTtl>>;
-    invalidateByTag?(tag: string): void | Promise<void>;
+    invalidateByTag?(tag: string): void | number | Promise<void | number>;
     getStats?(): CacheStats;
     resetStats?(): void;
     destroy?(): void;
@@ -91,6 +98,35 @@ export interface MemoryCacheOptions {
  */
 export interface LockManager {
     isLocked(key: string): boolean;
+}
+
+/**
+ * 已获取的缓存 lease。
+ */
+export interface CacheLease {
+    key: string;
+    token: string;
+    ttlMs: number;
+    expiresAt: number;
+    release(): Promise<boolean>;
+    renew(ttlMs?: number): Promise<boolean>;
+}
+
+/**
+ * 通用缓存 lease 存储。
+ */
+export interface CacheLeaseStore {
+    acquireLease(key: string, ttlMs: number): Promise<CacheLease | undefined>;
+    releaseLease(key: string, token: string): Promise<boolean>;
+    renewLease(key: string, token: string, ttlMs: number): Promise<boolean>;
+}
+
+/**
+ * Redis lease 所需的最小客户端能力。
+ */
+export interface RedisLeaseClient {
+    set(key: string, value: string, nx: 'NX', px: 'PX', ttlMs: number): Promise<'OK' | null>;
+    eval(script: string, keyCount: number, ...args: Array<string | number>): Promise<unknown>;
 }
 
 /**

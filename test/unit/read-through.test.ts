@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { readThrough } from "../../src/read-through.js";
+import { readThrough, readThroughWithLease } from "../../src/read-through.js";
 import { MemoryCache } from "../../src/memory-cache.js";
-import type { CacheLike } from "../../src/types.js";
+import type { CacheLease, CacheLeaseStore, CacheLike } from "../../src/types.js";
 
 // ── 辅助工厂 ──
 
@@ -17,6 +17,69 @@ function makeFetcher<T>(value: T) {
     return value;
   };
   return { fn, getCalls: () => calls };
+}
+
+function makeLeaseStore(options?: {
+  grant?: boolean;
+  renewResult?: boolean;
+}): CacheLeaseStore & {
+  acquireCalls: () => number;
+  releaseCalls: () => number;
+  renewCalls: () => number;
+  lastTtl: () => number | undefined;
+} {
+  const grant = options?.grant ?? true;
+  const renewResult = options?.renewResult ?? true;
+  let held = false;
+  let acquireCount = 0;
+  let releaseCount = 0;
+  let renewCount = 0;
+  let lastTtl: number | undefined;
+
+  return {
+    acquireCalls: () => acquireCount,
+    releaseCalls: () => releaseCount,
+    renewCalls: () => renewCount,
+    lastTtl: () => lastTtl,
+    async acquireLease(key: string, ttlMs: number): Promise<CacheLease | undefined> {
+      acquireCount++;
+      lastTtl = ttlMs;
+      if (!grant || held) {
+        return undefined;
+      }
+      held = true;
+      const lease: CacheLease = {
+        key,
+        token: `token:${key}`,
+        ttlMs,
+        expiresAt: Date.now() + ttlMs,
+        async release() {
+          releaseCount++;
+          held = false;
+          return true;
+        },
+        async renew(nextTtlMs = lease.ttlMs) {
+          renewCount++;
+          if (!renewResult) {
+            return false;
+          }
+          lease.ttlMs = nextTtlMs;
+          lease.expiresAt = Date.now() + nextTtlMs;
+          return true;
+        },
+      };
+      return lease;
+    },
+    async releaseLease() {
+      releaseCount++;
+      held = false;
+      return true;
+    },
+    async renewLease() {
+      renewCount++;
+      return renewResult;
+    },
+  };
 }
 
 // ── 测试套件 ──
@@ -414,5 +477,438 @@ describe("readThrough", () => {
       expect(calls).toBe(2);
       expect(result).toBe("value-2");
     });
+  });
+});
+
+describe("readThroughWithLease", () => {
+  let cache: MemoryCache;
+
+  beforeEach(() => {
+    cache = makeCache();
+  });
+
+  it("缓存命中时直接返回，不获取 lease", async () => {
+    cache.set("key", "cached");
+    const leaseStore = makeLeaseStore();
+    const fetcher = vi.fn(async () => "fresh");
+
+    expect(
+      await readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "key",
+        fetcher,
+        leaseStore,
+      }),
+    ).toBe("cached");
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(leaseStore.acquireCalls()).toBe(0);
+  });
+
+  it("拿到 lease 的调用者执行 fetcher、写入缓存并释放 lease", async () => {
+    const leaseStore = makeLeaseStore();
+    const fetcher = vi.fn(async () => ({ id: 1 }));
+
+    const result = await readThroughWithLease({
+      cache,
+      ttlMs: 1000,
+      key: "owner-key",
+      fetcher,
+      leaseStore,
+    });
+
+    expect(result).toEqual({ id: 1 });
+    expect(cache.get("owner-key")).toEqual({ id: 1 });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(leaseStore.renewCalls()).toBe(1);
+    expect(leaseStore.releaseCalls()).toBe(1);
+  });
+
+  it("拿到 lease 后若缓存已被填充，则直接返回缓存值且不调用 fetcher", async () => {
+    let getCalls = 0;
+    const raceCache: CacheLike = {
+      get: async () => {
+        getCalls++;
+        return getCalls === 1 ? undefined : "filled-during-race";
+      },
+      set: vi.fn(),
+      del: async () => false,
+      exists: async () => false,
+      has: async () => false,
+      clear: async () => {},
+      getMany: async () => ({}),
+      setMany: async () => true,
+      delMany: async () => 0,
+      delPattern: async () => 0,
+      keys: async () => [],
+    };
+    const leaseStore = makeLeaseStore();
+    const fetcher = vi.fn(async () => "fresh");
+
+    expect(
+      await readThroughWithLease({
+        cache: raceCache,
+        ttlMs: 1000,
+        key: "race-key",
+        fetcher,
+        leaseStore,
+      }),
+    ).toBe("filled-during-race");
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(raceCache.set).not.toHaveBeenCalled();
+    expect(leaseStore.releaseCalls()).toBe(1);
+  });
+
+  it("10000 并发 miss 只触发一次 fetcher", async () => {
+    const leaseStore = makeLeaseStore();
+    let calls = 0;
+    const fetcher = async () => {
+      calls++;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return "single-flight";
+    };
+
+    const results = await Promise.all(
+      Array.from({ length: 10000 }, () =>
+        readThroughWithLease({
+          cache,
+          ttlMs: 2000,
+          key: "burst-key",
+          fetcher,
+          leaseStore,
+        }),
+      ),
+    );
+
+    expect(calls).toBe(1);
+    expect(leaseStore.acquireCalls()).toBe(1);
+    expect(results).toHaveLength(10000);
+    expect(results.every((value) => value === "single-flight")).toBe(true);
+  });
+
+  it("inflight Promise 失败时后续并发请求会重新执行 lease 周期", async () => {
+    const leaseStore = makeLeaseStore();
+    let callCount = 0;
+    const fetcher = async () => {
+      callCount++;
+      if (callCount === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        throw new Error("first failure");
+      }
+      return "recovered";
+    };
+
+    const [r1, r2] = await Promise.allSettled([
+      readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "lease-inflight-fail",
+        fetcher,
+        leaseStore,
+      }),
+      readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "lease-inflight-fail",
+        fetcher,
+        leaseStore,
+      }),
+    ]);
+
+    expect(r1.status).toBe("rejected");
+    expect(r2.status).toBe("fulfilled");
+    if (r2.status === "fulfilled") {
+      expect(r2.value).toBe("recovered");
+    }
+    expect(callCount).toBe(2);
+  });
+
+  it("未拿到 lease 时等待 owner 写入缓存并返回缓存值", async () => {
+    const leaseStore = makeLeaseStore({ grant: false });
+    const fetcher = vi.fn(async () => "should-not-fetch");
+
+    const resultP = readThroughWithLease({
+      cache,
+      ttlMs: 1000,
+      key: "wait-key",
+      fetcher,
+      leaseStore,
+      waitForOwnerMs: 50,
+      pollIntervalMs: 1,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    cache.set("wait-key", "filled-by-owner");
+
+    expect(await resultP).toBe("filled-by-owner");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("未拿到 lease 且等待超时后默认执行 fetcher 兜底", async () => {
+    const leaseStore = makeLeaseStore({ grant: false });
+    const fetcher = vi.fn(async () => "fallback");
+
+    expect(
+      await readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "fallback-key",
+        fetcher,
+        leaseStore,
+        waitForOwnerMs: 1,
+        pollIntervalMs: 1,
+      }),
+    ).toBe("fallback");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("第一次未拿到 lease，等待超时后第二次拿到 lease 并写入缓存", async () => {
+    let attempts = 0;
+    let releaseCalls = 0;
+    const leaseStore: CacheLeaseStore = {
+      async acquireLease(key, ttlMs) {
+        attempts++;
+        if (attempts === 1) {
+          return undefined;
+        }
+        const lease: CacheLease = {
+          key,
+          token: "retry-token",
+          ttlMs,
+          expiresAt: Date.now() + ttlMs,
+          async release() {
+            releaseCalls++;
+            return true;
+          },
+          async renew() {
+            return true;
+          },
+        };
+        return lease;
+      },
+      async releaseLease() {
+        return true;
+      },
+      async renewLease() {
+        return true;
+      },
+    };
+
+    expect(
+      await readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "retry-owner-key",
+        fetcher: async () => "fresh-after-retry",
+        leaseStore,
+        waitForOwnerMs: 1,
+        pollIntervalMs: 1,
+      }),
+    ).toBe("fresh-after-retry");
+    expect(attempts).toBe(2);
+    expect(releaseCalls).toBe(1);
+    expect(cache.get("retry-owner-key")).toBe("fresh-after-retry");
+  });
+
+  it("onLeaseTimeout=throw 时等待超时直接抛错", async () => {
+    const leaseStore = makeLeaseStore({ grant: false });
+
+    await expect(
+      readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "timeout-key",
+        fetcher: async () => "fallback",
+        leaseStore,
+        waitForOwnerMs: 1,
+        pollIntervalMs: 1,
+        onLeaseTimeout: "throw",
+      }),
+    ).rejects.toThrow("readThroughWithLease timeout");
+  });
+
+  it("fetcher 返回 undefined 时不写入缓存", async () => {
+    const leaseStore = makeLeaseStore();
+
+    await readThroughWithLease({
+      cache,
+      ttlMs: 1000,
+      key: "undefined-key",
+      fetcher: async () => undefined,
+      leaseStore,
+    });
+
+    expect(cache.get("undefined-key")).toBeUndefined();
+  });
+
+  it("lease 续租失败时返回 fresh，但不写入缓存", async () => {
+    const leaseStore = makeLeaseStore({ renewResult: false });
+
+    expect(
+      await readThroughWithLease({
+        cache,
+        ttlMs: 1000,
+        key: "lost-lease-key",
+        fetcher: async () => "fresh",
+        leaseStore,
+      }),
+    ).toBe("fresh");
+    expect(cache.get("lost-lease-key")).toBeUndefined();
+  });
+
+  it("ttlMs <= 0 时直接穿透，不获取 lease", async () => {
+    cache.set("key", "cached");
+    const leaseStore = makeLeaseStore();
+
+    expect(
+      await readThroughWithLease({
+        cache,
+        ttlMs: 0,
+        key: "key",
+        fetcher: async () => "fresh",
+        leaseStore,
+      }),
+    ).toBe("fresh");
+    expect(leaseStore.acquireCalls()).toBe(0);
+  });
+
+  it("自定义 leaseTtlMs 小于 1 时归一化为 1ms", async () => {
+    const leaseStore = makeLeaseStore();
+
+    await readThroughWithLease({
+      cache,
+      ttlMs: 1000,
+      key: "ttl-clamp-key",
+      fetcher: async () => "fresh",
+      leaseStore,
+      leaseTtlMs: 0,
+    });
+
+    expect(leaseStore.lastTtl()).toBe(1);
+  });
+
+  it("readThroughWithLease 的 inflight 定时器触发后仍能返回结果", async () => {
+    vi.useFakeTimers();
+    try {
+      const leaseStore = makeLeaseStore();
+      let resolveFetch!: (value: string) => void;
+      const pendingFetch = new Promise<string>((resolve) => {
+        resolveFetch = resolve;
+      });
+
+      const resultP = readThroughWithLease({
+        cache,
+        ttlMs: 60000,
+        key: "lease-timer-key",
+        fetcher: () => pendingFetch,
+        leaseStore,
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(300001);
+
+      resolveFetch("timer-ok");
+      expect(await resultP).toBe("timer-ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lease inflight 条目达到上限时触发 10% 清理", async () => {
+    vi.useFakeTimers();
+    try {
+      const leaseStore: CacheLeaseStore = {
+        async acquireLease(key, ttlMs) {
+          return {
+            key,
+            token: `token:${key}`,
+            ttlMs,
+            expiresAt: Date.now() + ttlMs,
+            async release() {
+              return true;
+            },
+            async renew() {
+              return true;
+            },
+          };
+        },
+        async releaseLease() {
+          return true;
+        },
+        async renewLease() {
+          return true;
+        },
+      };
+
+      const resolvers: Array<() => void> = [];
+      const inflightPromises: Array<Promise<string>> = [];
+      for (let i = 0; i < 10000; i++) {
+        let resolve!: () => void;
+        const pendingP = new Promise<void>((r) => {
+          resolve = r;
+        });
+        resolvers.push(resolve);
+        inflightPromises.push(
+          readThroughWithLease({
+            cache,
+            ttlMs: 60000,
+            key: `lease-overflow-${i}`,
+            leaseStore,
+            fetcher: () => pendingP.then(() => `v${i}`),
+          }),
+        );
+      }
+
+      let triggerResolve!: (value: string) => void;
+      const triggerFetch = new Promise<string>((resolve) => {
+        triggerResolve = resolve;
+      });
+      const triggerResult = readThroughWithLease({
+        cache,
+        ttlMs: 60000,
+        key: "lease-overflow-trigger",
+        leaseStore,
+        fetcher: () => triggerFetch,
+      });
+
+      resolvers.forEach((resolve) => resolve());
+      triggerResolve("overflow-triggered");
+
+      await Promise.all([...inflightPromises, triggerResult]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cache.set 失败时仍返回 fetcher 的值并释放 lease", async () => {
+    const badCache: CacheLike = {
+      get: async () => undefined,
+      set: async () => {
+        throw new Error("write failed");
+      },
+      del: async () => false,
+      exists: async () => false,
+      has: async () => false,
+      clear: async () => {},
+      getMany: async () => ({}),
+      setMany: async () => true,
+      delMany: async () => 0,
+      delPattern: async () => 0,
+      keys: async () => [],
+    };
+    const leaseStore = makeLeaseStore();
+
+    expect(
+      await readThroughWithLease({
+        cache: badCache,
+        ttlMs: 1000,
+        key: "bad-cache-key",
+        fetcher: async () => "fresh",
+        leaseStore,
+      }),
+    ).toBe("fresh");
+    expect(leaseStore.releaseCalls()).toBe(1);
   });
 });

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MultiLevelCache } from "../../src/multi-level-cache.js";
 import { MemoryCache } from "../../src/memory-cache.js";
-import type { CacheLike } from "../../src/types.js";
+import type { CacheLike, CacheSetOptions } from "../../src/types.js";
 
 // ── 辅助工厂 ──
 
@@ -18,6 +18,8 @@ function makeRemote(): CacheLike & {
 } {
   const store: Record<string, any> = {};
   const expireAtByKey: Record<string, number | null> = {};
+  const tagsByKey = new Map<string, Set<string>>();
+  const keySetByTag = new Map<string, Set<string>>();
   let delay = 0;
 
   const wait = () =>
@@ -46,6 +48,38 @@ function makeRemote(): CacheLike & {
     return remaining > 0 ? remaining : undefined;
   };
 
+  const cleanupTagsForKey = (key: string) => {
+    const tags = tagsByKey.get(key);
+    if (!tags) {
+      return;
+    }
+    for (const tag of tags) {
+      const taggedKeys = keySetByTag.get(tag);
+      taggedKeys?.delete(key);
+      if (taggedKeys?.size === 0) {
+        keySetByTag.delete(tag);
+      }
+    }
+    tagsByKey.delete(key);
+  };
+
+  const registerTagsForKey = (key: string, tags?: string[]) => {
+    cleanupTagsForKey(key);
+    if (!tags || tags.length === 0) {
+      return;
+    }
+    const unique = new Set(tags);
+    tagsByKey.set(key, unique);
+    for (const tag of unique) {
+      let taggedKeys = keySetByTag.get(tag);
+      if (!taggedKeys) {
+        taggedKeys = new Set<string>();
+        keySetByTag.set(tag, taggedKeys);
+      }
+      taggedKeys.add(key);
+    }
+  };
+
   return {
     store,
     get delay() {
@@ -60,11 +94,12 @@ function makeRemote(): CacheLike & {
       purgeExpiredKey(key);
       return store[key];
     },
-    async set(key: string, value: any, ttl?: number) {
+    async set(key: string, value: any, ttl?: number, options?: CacheSetOptions) {
       await wait();
       store[key] = value;
       expireAtByKey[key] =
         ttl !== undefined && ttl > 0 ? Date.now() + ttl : null;
+      registerTagsForKey(key, options?.tags);
     },
     async del(key: string) {
       await wait();
@@ -72,6 +107,7 @@ function makeRemote(): CacheLike & {
       const existed = key in store;
       delete store[key];
       delete expireAtByKey[key];
+      cleanupTagsForKey(key);
       return existed;
     },
     async exists(key: string) {
@@ -90,6 +126,8 @@ function makeRemote(): CacheLike & {
         delete store[k];
         delete expireAtByKey[k];
       }
+      tagsByKey.clear();
+      keySetByTag.clear();
     },
     async getMany(keys: string[]) {
       await wait();
@@ -106,6 +144,7 @@ function makeRemote(): CacheLike & {
         store[key] = value;
         expireAtByKey[key] =
           ttl !== undefined && ttl > 0 ? Date.now() + ttl : null;
+        cleanupTagsForKey(key);
       }
       return true;
     },
@@ -117,6 +156,7 @@ function makeRemote(): CacheLike & {
         if (k in store) {
           delete store[k];
           delete expireAtByKey[k];
+          cleanupTagsForKey(k);
           count++;
         }
       }
@@ -134,6 +174,7 @@ function makeRemote(): CacheLike & {
         if (regex.test(k)) {
           delete store[k];
           delete expireAtByKey[k];
+          cleanupTagsForKey(k);
           count++;
         }
       }
@@ -170,6 +211,22 @@ function makeRemote(): CacheLike & {
         }
       }
       return result;
+    },
+    async invalidateByTag(tag: string) {
+      await wait();
+      const keys = [...(keySetByTag.get(tag) ?? [])];
+      let count = 0;
+      for (const key of keys) {
+        purgeExpiredKey(key);
+        if (key in store) {
+          delete store[key];
+          delete expireAtByKey[key];
+          count++;
+        }
+        cleanupTagsForKey(key);
+      }
+      keySetByTag.delete(tag);
+      return count;
     },
   };
 }
@@ -473,8 +530,25 @@ describe("MultiLevelCache", () => {
       const mlc = new MultiLevelCache({ local, remote });
 
       await mlc.set("k", "v", 5000);
-      expect(setLocalSpy).toHaveBeenCalledWith("k", "v", 5000);
-      expect(setRemoteSpy).toHaveBeenCalledWith("k", "v", 5000);
+      expect(setLocalSpy).toHaveBeenCalledWith("k", "v", 5000, undefined);
+      expect(setRemoteSpy).toHaveBeenCalledWith("k", "v", 5000, undefined);
+    });
+
+    it("set 传递 tags 到 L1 和 L2", async () => {
+      const local = makeLocal({ enableTags: true });
+      const remote = makeRemote();
+      const setRemoteSpy = vi.spyOn(remote, "set");
+      const setLocalSpy = vi.spyOn(local, "set");
+      const mlc = new MultiLevelCache({ local, remote });
+
+      await mlc.set("k", "v", 5000, { tags: ["user"] });
+
+      expect(setLocalSpy).toHaveBeenCalledWith("k", "v", 5000, {
+        tags: ["user"],
+      });
+      expect(setRemoteSpy).toHaveBeenCalledWith("k", "v", 5000, {
+        tags: ["user"],
+      });
     });
   });
 
@@ -918,20 +992,73 @@ describe("MultiLevelCache", () => {
   // ────────────────────────────────────────────────────────
 
   describe("invalidateByTag", () => {
-    it("委托 L1 的 invalidateByTag", () => {
+    it("委托 L1 的 invalidateByTag", async () => {
       const local = makeLocal({ enableTags: true });
       const mlc = new MultiLevelCache({ local });
       local.set("k", "v", undefined, { tags: ["user"] } as any);
 
-      mlc.invalidateByTag("user");
+      await mlc.invalidateByTag("user");
       expect(local.get("k")).toBeUndefined();
     });
 
-    it("L1 不支持 invalidateByTag 时不抛异常", () => {
+    it("L1 不支持 invalidateByTag 时不抛异常", async () => {
       const local = makeLocal();
       const mockLocal = Object.assign(local, { invalidateByTag: undefined });
       const mlc = new MultiLevelCache({ local: mockLocal });
-      expect(() => mlc.invalidateByTag("tag")).not.toThrow();
+      await expect(mlc.invalidateByTag("tag")).resolves.toBeUndefined();
+    });
+
+    it("同时失效 L1 和 L2 的 tag 数据", async () => {
+      const local = makeLocal({ enableTags: true });
+      const remote = makeRemote();
+      const mlc = new MultiLevelCache({ local, remote });
+
+      await mlc.set("k", "v", 1000, { tags: ["user"] });
+      await mlc.invalidateByTag("user");
+
+      expect(local.get("k")).toBeUndefined();
+      expect(remote.store["k"]).toBeUndefined();
+    });
+
+    it("L2 tag 失效失败时默认忽略并保留 L1 结果", async () => {
+      const local = makeLocal({ enableTags: true });
+      const remote = makeRemote();
+      vi.spyOn(remote, "invalidateByTag").mockRejectedValue(
+        new Error("redis down"),
+      );
+      const mlc = new MultiLevelCache({ local, remote });
+      local.set("k", "v", undefined, { tags: ["user"] } as any);
+
+      await expect(mlc.invalidateByTag("user")).resolves.toBeUndefined();
+      expect(local.get("k")).toBeUndefined();
+    });
+
+    it("remoteInvalidationErrors=throw 时透传 L2 tag 失效错误", async () => {
+      const local = makeLocal({ enableTags: true });
+      const remote = makeRemote();
+      vi.spyOn(remote, "invalidateByTag").mockRejectedValue(
+        new Error("redis down"),
+      );
+      const mlc = new MultiLevelCache({
+        local,
+        remote,
+        remoteInvalidationErrors: "throw",
+      });
+
+      await expect(mlc.invalidateByTag("user")).rejects.toThrow("redis down");
+    });
+
+    it("invalidateByTag 触发 publish 回调", async () => {
+      const publishFn = vi.fn();
+      const { mlc } = makeCache({ publish: publishFn });
+
+      await mlc.invalidateByTag("user");
+
+      expect(publishFn).toHaveBeenCalledOnce();
+      expect(publishFn.mock.calls[0][0]).toMatchObject({
+        type: "invalidateTag",
+        tag: "user",
+      });
     });
   });
 

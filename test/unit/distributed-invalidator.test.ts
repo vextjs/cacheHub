@@ -132,6 +132,7 @@ function makeCacheMock(): CacheLike {
     setMany: vi.fn().mockReturnValue(true),
     delMany: vi.fn().mockReturnValue(0),
     delPattern: vi.fn().mockResolvedValue(3),
+    invalidateByTag: vi.fn().mockResolvedValue(2),
     keys: vi.fn().mockReturnValue([]),
   };
 }
@@ -258,6 +259,7 @@ describe("DistributedCacheInvalidator — 构造函数", () => {
     expect(stats.messagesSent).toBe(0);
     expect(stats.messagesReceived).toBe(0);
     expect(stats.invalidationsTriggered).toBe(0);
+    expect(stats.tagInvalidationsTriggered).toBe(0);
     expect(stats.errors).toBe(0);
   });
 });
@@ -391,6 +393,160 @@ describe("DistributedCacheInvalidator — invalidate()", () => {
     expect(msg.ts).toBeGreaterThanOrEqual(before);
     expect(msg.ts).toBeLessThanOrEqual(after);
   });
+
+  it("invalidatePattern 是 invalidate 的语义化别名", async () => {
+    const { invalidator, cache } = makeInvalidator();
+
+    await invalidator.invalidatePattern("alias:*");
+
+    expect(cache.delPattern).toHaveBeenCalledWith("alias:*");
+    expect(invalidator.getStats().messagesSent).toBe(1);
+  });
+});
+
+// ──────────────────────────────────────────────
+// invalidateTag()
+// ──────────────────────────────────────────────
+
+describe("DistributedCacheInvalidator — invalidateTag()", () => {
+  it("先失效本地 tag，再发布 tag 消息", async () => {
+    const pub = makeRedisMock();
+    const cache = makeCacheMock();
+    const order: string[] = [];
+
+    (cache.invalidateByTag as any).mockImplementation(async () => {
+      order.push("local-tag");
+      return 1;
+    });
+    pub.publish.mockImplementation(async () => {
+      order.push("publish");
+      return 1;
+    });
+
+    const { invalidator } = makeInvalidator({ cache }, pub);
+    await invalidator.invalidateTag("user");
+
+    expect(order).toEqual(["local-tag", "publish"]);
+  });
+
+  it("发布消息包含 tag 字段并更新统计", async () => {
+    const { invalidator, pub } = makeInvalidator({
+      instanceId: "sender",
+      channel: "ch:x",
+    });
+
+    await invalidator.invalidateTag("user");
+
+    const [publishedChannel, rawMsg] = pub.publish.mock.calls[0] as [
+      string,
+      string,
+    ];
+    expect(publishedChannel).toBe("ch:x");
+    expect(JSON.parse(rawMsg)).toMatchObject({
+      type: "invalidate-tag",
+      tag: "user",
+      instanceId: "sender",
+    });
+    expect(invalidator.getStats().messagesSent).toBe(1);
+    expect(invalidator.getStats().tagInvalidationsTriggered).toBe(1);
+  });
+
+  it("空 tag 不发布消息", async () => {
+    const { invalidator, pub } = makeInvalidator();
+
+    await invalidator.invalidateTag("");
+
+    expect(pub.publish).not.toHaveBeenCalled();
+    expect(invalidator.getStats().messagesSent).toBe(0);
+  });
+
+  it("本地 cache 不支持 invalidateByTag 时记录错误但仍广播给其他实例", async () => {
+    const logger: Required<DistributedInvalidatorLogger> = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const pub = makeRedisMock();
+    const cache = Object.assign(makeCacheMock(), { invalidateByTag: undefined });
+    const { invalidator } = makeInvalidator({ cache, logger }, pub);
+
+    await expect(invalidator.invalidateTag("user")).resolves.toBeUndefined();
+    expect(pub.publish).toHaveBeenCalledOnce();
+    expect(invalidator.getStats().errors).toBe(1);
+    expect(invalidator.getStats().tagInvalidationsTriggered).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("does not support invalidateByTag"),
+    );
+  });
+
+  it("本地 tag 失效失败时不发布，并向外抛出错误", async () => {
+    const logger: Required<DistributedInvalidatorLogger> = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const pub = makeRedisMock();
+    const cache = makeCacheMock();
+    (cache.invalidateByTag as any).mockRejectedValue(new Error("tag local failed"));
+    const { invalidator } = makeInvalidator({ cache, logger }, pub);
+
+    await expect(invalidator.invalidateTag("user")).rejects.toThrow(
+      "tag local failed",
+    );
+    expect(pub.publish).not.toHaveBeenCalled();
+    expect(invalidator.getStats().errors).toBe(1);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("tag invalidation error"),
+    );
+  });
+
+  it("publish 失败时 errors +1 并向外抛出", async () => {
+    const pub = makeRedisMock();
+    pub.publish = vi.fn().mockRejectedValue(new Error("publish failed"));
+    const { invalidator } = makeInvalidator({}, pub);
+
+    await expect(invalidator.invalidateTag("user")).rejects.toThrow(
+      "publish failed",
+    );
+    expect(invalidator.getStats().errors).toBe(1);
+  });
+
+  it("invalidateTag 成功时调用 logger.debug", async () => {
+    const logger: Required<DistributedInvalidatorLogger> = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const { invalidator } = makeInvalidator({ logger });
+
+    await invalidator.invalidateTag("user");
+
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining("published tag invalidation"),
+    );
+  });
+
+  it("invalidateTag 发布失败时调用 logger.error", async () => {
+    const logger: Required<DistributedInvalidatorLogger> = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const pub = makeRedisMock();
+    pub.publish = vi.fn().mockRejectedValue(new Error("tag publish failed"));
+    const { invalidator } = makeInvalidator({ logger }, pub);
+
+    await expect(invalidator.invalidateTag("user")).rejects.toThrow(
+      "tag publish failed",
+    );
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("publish error"),
+    );
+  });
 });
 
 // ──────────────────────────────────────────────
@@ -435,6 +591,35 @@ describe("DistributedCacheInvalidator — 消息接收", () => {
     sub._triggerMessage("test:channel", raw);
     await flushAsync();
     expect(invalidator.getStats().invalidationsTriggered).toBe(1);
+  });
+
+  it("收到 invalidate-pattern 新消息类型后调用 cache.delPattern", async () => {
+    const { sub, cache } = makeInvalidator({ instanceId: "me" });
+    const raw = JSON.stringify({
+      type: "invalidate-pattern",
+      pattern: "new:*",
+      instanceId: "other",
+      ts: Date.now(),
+    });
+    sub._triggerMessage("test:channel", raw);
+    await flushAsync();
+    expect(cache.delPattern).toHaveBeenCalledWith("new:*");
+  });
+
+  it("收到其他实例 tag 消息后调用 cache.invalidateByTag", async () => {
+    const { invalidator, sub, cache } = makeInvalidator({ instanceId: "me" });
+    const raw = JSON.stringify({
+      type: "invalidate-tag",
+      tag: "user",
+      instanceId: "other",
+      ts: Date.now(),
+    });
+
+    sub._triggerMessage("test:channel", raw);
+    await flushAsync();
+
+    expect(cache.invalidateByTag).toHaveBeenCalledWith("user");
+    expect(invalidator.getStats().tagInvalidationsTriggered).toBe(1);
   });
 
   it("忽略自身消息（instanceId 过滤）：不调用 cache.delPattern", async () => {
@@ -525,6 +710,50 @@ describe("DistributedCacheInvalidator — 消息接收", () => {
     expect(cache.delPattern).not.toHaveBeenCalled();
   });
 
+  it("tag 为空字符串时忽略，不调用 invalidateByTag", async () => {
+    const { sub, cache } = makeInvalidator({ instanceId: "me" });
+    const raw = JSON.stringify({
+      type: "invalidate-tag",
+      tag: "",
+      instanceId: "other",
+      ts: Date.now(),
+    });
+    sub._triggerMessage("test:channel", raw);
+    await flushAsync();
+    expect(cache.invalidateByTag).not.toHaveBeenCalled();
+  });
+
+  it("收到 tag 消息时 cache.invalidateByTag 抛错只记录错误，不向外传播", async () => {
+    const logger: Required<DistributedInvalidatorLogger> = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const cache = makeCacheMock();
+    (cache.invalidateByTag as any).mockRejectedValue(new Error("tag down"));
+    const { invalidator, sub } = makeInvalidator({
+      instanceId: "me",
+      cache,
+      logger,
+    });
+    const raw = JSON.stringify({
+      type: "invalidate-tag",
+      tag: "user",
+      instanceId: "other",
+      ts: Date.now(),
+    });
+
+    sub._triggerMessage("test:channel", raw);
+    await flushAsync();
+
+    expect(invalidator.getStats().errors).toBe(1);
+    expect(invalidator.getStats().tagInvalidationsTriggered).toBe(0);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("tag invalidation error"),
+    );
+  });
+
   it("cache.delPattern 抛出时：errors +1，不向外传播，invalidationsTriggered 不增加", async () => {
     const cache = makeCacheMock();
     (cache.delPattern as ReturnType<typeof vi.fn>).mockRejectedValue(
@@ -611,6 +840,7 @@ describe("DistributedCacheInvalidator — getStats()", () => {
       messagesSent: 0,
       messagesReceived: 0,
       invalidationsTriggered: 0,
+      tagInvalidationsTriggered: 0,
       errors: 0,
       instanceId: "id-1",
       channel: "ch:1",

@@ -22,6 +22,8 @@ import { MultiLevelCache } from "../../src/multi-level-cache.js";
 import { MemoryCache } from "../../src/memory-cache.js";
 import { createRedisAtomicStateBackend } from "../../src/atomic.js";
 import { createRedisRateLimitStateStore } from "../../src/rate-limit.js";
+import { createRedisLeaseStore } from "../../src/redis-lease.js";
+import { readThroughWithLease } from "../../src/read-through.js";
 
 // ── 环境配置 ──
 
@@ -367,6 +369,57 @@ describeIfRedis("Redis 集成测试", () => {
       expect(instance).toBeDefined();
       expect(typeof (instance as any).ping).toBe("function");
     });
+
+    it("invalidateByTag 删除带 tag 的 key，并保留其他 key", async () => {
+      if (!redisAvailable) return;
+
+      const taggedAdapter = createRedisCacheAdapter(REDIS_URL, {
+        metaKeyPrefix: `${TEST_PREFIX}adapter:meta`,
+      });
+      const userKey = `${TEST_PREFIX}adapter:tag:user`;
+      const orderKey = `${TEST_PREFIX}adapter:tag:order`;
+
+      try {
+        await taggedAdapter.set(userKey, { id: 1 }, 10000, {
+          tags: ["user:1", "tenant:a"],
+        });
+        await taggedAdapter.set(orderKey, { id: 2 }, 10000, {
+          tags: ["order:1", "tenant:a"],
+        });
+
+        expect(await taggedAdapter.invalidateByTag("user:1")).toBe(1);
+        expect(await taggedAdapter.get(userKey)).toBeUndefined();
+        expect(await taggedAdapter.get(orderKey)).toEqual({ id: 2 });
+
+        expect(await taggedAdapter.invalidateByTag("tenant:a")).toBe(1);
+        expect(await taggedAdapter.get(orderKey)).toBeUndefined();
+      } finally {
+        await taggedAdapter.delPattern(`${TEST_PREFIX}adapter:tag:*`);
+        await taggedAdapter.delPattern(`${TEST_PREFIX}adapter:meta:*`);
+        await taggedAdapter.close();
+      }
+    });
+
+    it("无 tag 覆写会清理旧 tag 索引，后续 tag 失效不误删新值", async () => {
+      if (!redisAvailable) return;
+
+      const taggedAdapter = createRedisCacheAdapter(REDIS_URL, {
+        metaKeyPrefix: `${TEST_PREFIX}adapter:meta-stale`,
+      });
+      const key = `${TEST_PREFIX}adapter:tag:overwrite`;
+
+      try {
+        await taggedAdapter.set(key, "old", 10000, { tags: ["old-tag"] });
+        await taggedAdapter.set(key, "new", 10000);
+
+        expect(await taggedAdapter.invalidateByTag("old-tag")).toBe(0);
+        expect(await taggedAdapter.get(key)).toBe("new");
+      } finally {
+        await taggedAdapter.del(key);
+        await taggedAdapter.delPattern(`${TEST_PREFIX}adapter:meta-stale:*`);
+        await taggedAdapter.close();
+      }
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────
@@ -619,6 +672,33 @@ describeIfRedis("Redis 集成测试", () => {
         await remote.close();
       }
     });
+
+    it("invalidateByTag 同时清理 L1 和 L2", async () => {
+      if (!redisAvailable) return;
+
+      const local = new MemoryCache({ maxEntries: 100, enableTags: true });
+      const remote = createRedisCacheAdapter(REDIS_URL, {
+        metaKeyPrefix: `${TEST_PREFIX}mlc:meta`,
+      });
+      const cache = new MultiLevelCache({ local, remote });
+      const key = `${TEST_PREFIX}mlc:tag:user`;
+
+      try {
+        await cache.set(key, { id: 1 }, 10000, { tags: ["user:1"] });
+
+        expect(local.get(key)).toEqual({ id: 1 });
+        expect(await remote.get(key)).toEqual({ id: 1 });
+
+        await cache.invalidateByTag("user:1");
+
+        expect(local.get(key)).toBeUndefined();
+        expect(await remote.get(key)).toBeUndefined();
+      } finally {
+        await remote.delPattern(`${TEST_PREFIX}mlc:tag:*`);
+        await remote.delPattern(`${TEST_PREFIX}mlc:meta:*`);
+        await remote.close();
+      }
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────
@@ -754,6 +834,43 @@ describeIfRedis("Redis 集成测试", () => {
       }
     });
 
+    it("invalidateTag 广播后接收方执行 invalidateByTag", async () => {
+      if (!redisAvailable) return;
+
+      const l1 = new MemoryCache({ maxEntries: 100, enableTags: true });
+      const channel = `${TEST_PREFIX}invalidator:tag-ch`;
+
+      const receiver = new DistributedCacheInvalidator({
+        redisUrl: REDIS_URL,
+        cache: l1,
+        channel,
+        instanceId: "tag-receiver",
+      });
+
+      const sender = new DistributedCacheInvalidator({
+        redisUrl: REDIS_URL,
+        cache: new MemoryCache({ enableTags: true }),
+        channel,
+        instanceId: "tag-sender",
+      });
+
+      try {
+        l1.set("tag:user:1", { id: 1 }, 10000, { tags: ["user:1"] });
+        expect(l1.get("tag:user:1")).toBeDefined();
+
+        await new Promise((r) => setTimeout(r, 300));
+        await sender.invalidateTag("user:1");
+        await new Promise((r) => setTimeout(r, 500));
+
+        expect(l1.get("tag:user:1")).toBeUndefined();
+        expect(receiver.getStats().tagInvalidationsTriggered).toBeGreaterThanOrEqual(1);
+        expect(sender.getStats().messagesSent).toBe(1);
+      } finally {
+        await receiver.close();
+        await sender.close();
+      }
+    });
+
     it("close 正常关闭：unsubscribe + sub.quit + pub.quit（shouldClosePub=true）", async () => {
       if (!redisAvailable) return;
 
@@ -865,6 +982,69 @@ describeIfRedis("Redis 集成测试", () => {
         await l2.delPattern(`${TEST_PREFIX}combined:*`);
         await l2.close();
       }
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Redis lease + readThroughWithLease
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("Redis lease + readThroughWithLease", () => {
+    let adapter: RedisCacheAdapter;
+
+    beforeAll(async () => {
+      if (!redisAvailable) return;
+      adapter = createRedisCacheAdapter(REDIS_URL, {
+        metaKeyPrefix: `${TEST_PREFIX}lease:meta`,
+      });
+    });
+
+    afterAll(async () => {
+      if (!redisAvailable || !adapter) return;
+      try {
+        await adapter.delPattern(`${TEST_PREFIX}lease:*`);
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    beforeEach(async () => {
+      if (!redisAvailable || !adapter) return;
+      await adapter.delPattern(`${TEST_PREFIX}lease:*`);
+    });
+
+    it("使用 Redis lease 时 200 并发 miss 只执行一次 fetcher", async () => {
+      if (!redisAvailable) return;
+
+      const leaseStore = createRedisLeaseStore(adapter, {
+        leaseKeyPrefix: `${TEST_PREFIX}lease:locks`,
+        ownerId: "integration",
+      });
+      const key = `${TEST_PREFIX}lease:single-flight`;
+      let calls = 0;
+
+      const results = await Promise.all(
+        Array.from({ length: 200 }, () =>
+          readThroughWithLease({
+            cache: adapter,
+            ttlMs: 5000,
+            key,
+            leaseStore,
+            leaseTtlMs: 1000,
+            waitForOwnerMs: 1500,
+            pollIntervalMs: 5,
+            fetcher: async () => {
+              calls++;
+              await new Promise((r) => setTimeout(r, 20));
+              return { ok: true, calls };
+            },
+          }),
+        ),
+      );
+
+      expect(calls).toBe(1);
+      expect(results.every((value) => value.ok === true)).toBe(true);
+      expect(await adapter.get(key)).toEqual({ ok: true, calls: 1 });
     });
   });
 });

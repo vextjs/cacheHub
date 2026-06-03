@@ -6,7 +6,8 @@
  * 1. 调用 invalidate(pattern) 时，先失效当前实例本地缓存，再通过 pub 连接广播失效消息
  * 2. 所有订阅同一频道的实例均会收到该消息
  * 3. instanceId 过滤：忽略自身发出的消息，避免本地重复失效
- * 4. 其他实例收到消息后，调用 cache.delPattern(pattern) 失效本地缓存
+ * 4. 其他实例收到 pattern 消息后调用 cache.delPattern(pattern)
+ * 5. 其他实例收到 tag 消息后调用 cache.invalidateByTag(tag)
  *
  * 提取自 monSQLize DistributedCacheInvalidator（重写为 TypeScript + CacheLike 接口）
  * 来源：技术方案 §9
@@ -81,6 +82,8 @@ export interface InvalidatorStats {
   messagesReceived: number;
   /** 实际触发 delPattern 的次数（含本地主动失效与接收其他实例消息） */
   invalidationsTriggered: number;
+  /** 实际触发 invalidateByTag 的次数（含本地主动失效与接收其他实例消息） */
+  tagInvalidationsTriggered: number;
   /** 错误次数（发布 / 订阅 / 消息解析 / 失效处理） */
   errors: number;
   /** 当前实例 ID */
@@ -90,12 +93,19 @@ export interface InvalidatorStats {
 }
 
 /** 内部消息格式（JSON 序列化后在 Pub/Sub 通道中传输） */
-interface InvalidationMessage {
-  type: "invalidate";
-  pattern: string;
-  instanceId: string;
-  ts: number;
-}
+type InvalidationMessage =
+  | {
+      type: "invalidate" | "invalidate-pattern";
+      pattern: string;
+      instanceId: string;
+      ts: number;
+    }
+  | {
+      type: "invalidate-tag";
+      tag: string;
+      instanceId: string;
+      ts: number;
+    };
 
 /** _buildConnections 返回结构 */
 interface RedisConnections {
@@ -190,6 +200,7 @@ export class DistributedCacheInvalidator {
     messagesSent: number;
     messagesReceived: number;
     invalidationsTriggered: number;
+    tagInvalidationsTriggered: number;
     errors: number;
   };
 
@@ -208,6 +219,7 @@ export class DistributedCacheInvalidator {
       messagesSent: 0,
       messagesReceived: 0,
       invalidationsTriggered: 0,
+      tagInvalidationsTriggered: 0,
       errors: 0,
     };
 
@@ -287,12 +299,23 @@ export class DistributedCacheInvalidator {
       }
 
       if (
-        msg.type === "invalidate" &&
+        (msg.type === "invalidate" || msg.type === "invalidate-pattern") &&
+        "pattern" in msg &&
         typeof msg.pattern === "string" &&
         msg.pattern.length > 0
       ) {
         // 异步处理，不阻塞 Redis 消息循环；错误在 _invalidateLocal 内捕获
-        void this._invalidateLocal(msg.pattern);
+        void this._invalidatePatternLocal(msg.pattern);
+        return;
+      }
+
+      if (
+        msg.type === "invalidate-tag" &&
+        "tag" in msg &&
+        typeof msg.tag === "string" &&
+        msg.tag.length > 0
+      ) {
+        void this._invalidateTagLocal(msg.tag);
       }
     });
   }
@@ -302,7 +325,7 @@ export class DistributedCacheInvalidator {
    * delPattern 返回 number | Promise<number>，统一 await。
    * @private
    */
-  private async _invalidateLocal(
+  private async _invalidatePatternLocal(
     pattern: string,
     rethrowErrors = false,
   ): Promise<void> {
@@ -316,6 +339,34 @@ export class DistributedCacheInvalidator {
       this._stats.errors++;
       this._logger?.error?.(
         `[cache-hub/distributed] invalidation error: ${(err as Error).message}`,
+      );
+      if (rethrowErrors) {
+        throw err;
+      }
+    }
+  }
+
+  private async _invalidateTagLocal(
+    tag: string,
+    rethrowErrors = false,
+  ): Promise<void> {
+    try {
+      if (!this._cache.invalidateByTag) {
+        this._stats.errors++;
+        this._logger?.warn?.(
+          `[cache-hub/distributed] cache does not support invalidateByTag: ${tag}`,
+        );
+        return;
+      }
+      await this._cache.invalidateByTag(tag);
+      this._stats.tagInvalidationsTriggered++;
+      this._logger?.debug?.(
+        `[cache-hub/distributed] invalidated tag: ${tag}`,
+      );
+    } catch (err: unknown) {
+      this._stats.errors++;
+      this._logger?.error?.(
+        `[cache-hub/distributed] tag invalidation error: ${(err as Error).message}`,
       );
       if (rethrowErrors) {
         throw err;
@@ -337,7 +388,7 @@ export class DistributedCacheInvalidator {
       return;
     }
 
-    await this._invalidateLocal(pattern, true);
+    await this._invalidatePatternLocal(pattern, true);
 
     const msg: InvalidationMessage = {
       type: "invalidate",
@@ -351,6 +402,45 @@ export class DistributedCacheInvalidator {
       this._stats.messagesSent++;
       this._logger?.debug?.(
         `[cache-hub/distributed] published invalidation: ${pattern}`,
+      );
+    } catch (err: unknown) {
+      this._stats.errors++;
+      this._logger?.error?.(
+        `[cache-hub/distributed] publish error: ${(err as Error).message}`,
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * 语义化 pattern 失效别名。保留 invalidate(pattern) 兼容旧调用。
+   */
+  async invalidatePattern(pattern: string): Promise<void> {
+    await this.invalidate(pattern);
+  }
+
+  /**
+   * 按 tag 广播缓存失效消息。
+   */
+  async invalidateTag(tag: string): Promise<void> {
+    if (!tag) {
+      return;
+    }
+
+    await this._invalidateTagLocal(tag, true);
+
+    const msg: InvalidationMessage = {
+      type: "invalidate-tag",
+      tag,
+      instanceId: this._instanceId,
+      ts: Date.now(),
+    };
+
+    try {
+      await this._pub.publish(this._channel, JSON.stringify(msg));
+      this._stats.messagesSent++;
+      this._logger?.debug?.(
+        `[cache-hub/distributed] published tag invalidation: ${tag}`,
       );
     } catch (err: unknown) {
       this._stats.errors++;

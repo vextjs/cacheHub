@@ -11,7 +11,12 @@
  * 来源：技术方案 §6
  */
 
-import type { CacheLike, CacheRemainingTtl, CacheStats } from "./types.js";
+import type {
+  CacheLike,
+  CacheRemainingTtl,
+  CacheSetOptions,
+  CacheStats,
+} from "./types.js";
 
 // ── 类型定义 ──
 
@@ -30,9 +35,15 @@ export interface MultiLevelCacheOptions {
   backfillOnRemoteHit?: boolean;
   /** 远端 get() 操作超时（毫秒），超时则降级为 miss（默认 50） */
   remoteTimeoutMs?: number;
-  /** 分布式失效发布函数（可选，delPattern 时调用） */
-  publish?: (msg: { type: string; pattern: string; ts: number }) => void;
+  /** 分布式失效发布函数（可选，delPattern / invalidateByTag 时调用） */
+  publish?: (msg: MultiLevelInvalidationMessage) => void;
+  /** tag 远端失效失败策略，默认 ignore 以保留既有 L2 容错风格 */
+  remoteInvalidationErrors?: "ignore" | "throw";
 }
+
+export type MultiLevelInvalidationMessage =
+  | { type: "delPattern"; pattern: string; ts: number }
+  | { type: "invalidateTag"; tag: string; ts: number };
 
 function normalizeBackfillTtl(ttl: CacheRemainingTtl): number {
   return ttl === null ? 0 : ttl;
@@ -83,8 +94,9 @@ export class MultiLevelCache implements CacheLike {
   private readonly _backfillOnRemoteHit: boolean;
   private readonly _remoteTimeoutMs: number;
   private readonly _publish:
-    | ((msg: { type: string; pattern: string; ts: number }) => void)
+    | ((msg: MultiLevelInvalidationMessage) => void)
     | undefined;
+  private readonly _remoteInvalidationErrors: "ignore" | "throw";
 
   constructor(options: MultiLevelCacheOptions) {
     this._local = options.local;
@@ -93,6 +105,7 @@ export class MultiLevelCache implements CacheLike {
     this._backfillOnRemoteHit = options.backfillOnRemoteHit ?? true;
     this._remoteTimeoutMs = options.remoteTimeoutMs ?? 50;
     this._publish = options.publish;
+    this._remoteInvalidationErrors = options.remoteInvalidationErrors ?? "ignore";
   }
 
   private async _resolveBackfillTtl(
@@ -208,24 +221,29 @@ export class MultiLevelCache implements CacheLike {
 
   // ── set ──
 
-  async set(key: string, value: any, ttl?: number): Promise<void> {
+  async set(
+    key: string,
+    value: any,
+    ttl?: number,
+    options?: CacheSetOptions,
+  ): Promise<void> {
     if (this._writePolicy === "both") {
       // A06：'both' 策略使用 Promise.all，L2.set() 失败向调用方透传
       // 注意：remoteTimeoutMs 不包装 set() 路径，L2.set() 超时由 ioredis 内置控制
       if (this._remote) {
         await Promise.all([
-          this._local.set(key, value, ttl),
-          this._remote.set(key, value, ttl),
+          this._local.set(key, value, ttl, options),
+          this._remote.set(key, value, ttl, options),
         ]);
       } else {
-        await this._local.set(key, value, ttl);
+        await this._local.set(key, value, ttl, options);
       }
     } else {
       // 'local-first-async-remote'：先同步写 L1，再异步 fire-and-forget 写 L2
-      await this._local.set(key, value, ttl);
+      await this._local.set(key, value, ttl, options);
       if (this._remote) {
         // fire-and-forget：L2 失败静默忽略，不等待
-        void Promise.resolve(this._remote.set(key, value, ttl)).catch(() => {});
+        void Promise.resolve(this._remote.set(key, value, ttl, options)).catch(() => {});
       }
     }
   }
@@ -416,9 +434,23 @@ export class MultiLevelCache implements CacheLike {
 
   // ── invalidateByTag ──
 
-  invalidateByTag(tag: string): void | Promise<void> {
+  async invalidateByTag(tag: string): Promise<void> {
     if (this._local.invalidateByTag) {
-      return this._local.invalidateByTag(tag);
+      await this._local.invalidateByTag(tag);
+    }
+
+    if (this._remote?.invalidateByTag) {
+      try {
+        await this._remote.invalidateByTag(tag);
+      } catch (err) {
+        if (this._remoteInvalidationErrors === "throw") {
+          throw err;
+        }
+      }
+    }
+
+    if (this._publish) {
+      this._publish({ type: "invalidateTag", tag, ts: Date.now() });
     }
   }
 
