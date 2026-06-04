@@ -8,7 +8,7 @@ cache-key serialization, atomic state backends, and rate-limit state primitives
 behind a small `CacheLike` contract.
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 [![Coverage: 100%](https://img.shields.io/badge/coverage-100%25-brightgreen)](#testing)
 
 Chinese documentation: [docs/README.zh-CN.md](./docs/README.zh-CN.md)
@@ -670,4 +670,4 @@ public subpath export.
 
 ## License
 
-[MIT](./LICENSE)
+[Apache-2.0](./LICENSE)

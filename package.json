@@ -1,6 +1,6 @@
 {
   "name": "cache-hub",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "types": "./dist/types/index.d.ts",
@@ -27,7 +27,7 @@
     "leaky-bucket",
     "zero-dependency"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/vextjs/cacheHub#readme",
   "bugs": {
     "url": "https://github.com/vextjs/cacheHub/issues"
