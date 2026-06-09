@@ -24,6 +24,7 @@
 
 | 版本 | 日期 | 变更摘要 | 详细 |
 |------|------|---------|------|
+| [v2.2.2](./changelogs/v2.2.2.md) | 2026-06-09 | Patch 更新：固定 direct devDependencies 为精确版本，避免本仓验证链依赖范围漂移 | [查看](./changelogs/v2.2.2.md) |
 | [v2.2.1](./changelogs/v2.2.1.md) | 2026-06-04 | Patch 更新：许可证元数据与 npm 包分发口径迁移到 Apache-2.0 | [查看](./changelogs/v2.2.1.md) |
 | [v2.2.0](./changelogs/v2.2.0.md) | 2026-06-03 | Minor 更新：新增 Redis tag index、跨实例 tag 失效、Redis lease 与 `readThroughWithLease`，支撑响应缓存短 TTL 并发去重 | [查看](./changelogs/v2.2.0.md) |
 | [v2.1.0](./changelogs/v2.1.0.md) | 2026-06-01 | Minor 更新：新增 `cache-hub/atomic` 原子状态后端，并扩展 `cache-hub/rate-limit` 的滑窗与桶类 Redis Lua 状态原语 | [查看](./changelogs/v2.1.0.md) |
@@ -37,6 +38,7 @@
 
 | 版本 | 新增 | 变更 | 修复 | 移除 |
 |------|------|------|------|------|
+| v2.2.2 | - | direct devDependencies 固定为 package-lock 已解析精确版本 | - | - |
 | v2.2.1 | - | 许可证元数据、LICENSE、README badge 与 root lockfile 迁移到 Apache-2.0 | - | - |
 | v2.2.0 | Redis tag index、`cache-hub/lease`、`readThroughWithLease` | `CacheLike.set` 支持 `CacheSetOptions`，publish workflow 补充 Redis 集成测试 | Redis tag 元数据覆盖清理，短 TTL 并发回源去重 | - |
 | v2.1.0 | `cache-hub/atomic`、滑窗/token-bucket/leaky-bucket 状态原语 | fixed-window 内部复用原子后端，README/profile 同步 | Redis 高并发状态更新补齐原子路径 | - |
@@ -56,4 +58,4 @@
 
 ---
 
-**最后更新**: 2026-06-04
+**最后更新**: 2026-06-09
