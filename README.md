@@ -421,10 +421,13 @@ The Redis adapter implements `CacheLike` and adds:
 | `getRemainingTtl(key)` | Returns remaining TTL in milliseconds, `null` for non-expiring keys, and `undefined` for missing keys. |
 | `getRemainingTtlMany(keys)` | Batch TTL lookup. |
 | `invalidateByTag(tag)` | Deletes cache entries attached to a tag and returns the number of deleted business keys. |
+| `pruneTagMetadata(tag)` | Optional maintenance helper that removes stale tag metadata for business keys that already expired naturally. |
 | `close()` | Closes only the connection created by the adapter. Externally supplied ioredis instances are not closed. |
 | `getRedisInstance()` | Returns the underlying ioredis instance for advanced use cases. |
 
 Pattern operations use `SCAN` with `COUNT 100`; `KEYS` is not used.
+For tagged writes with a TTL, the reverse `key-tags` metadata receives the same TTL.
+Tag sets are not given a direct TTL because one tag can contain both non-expiring and short-lived keys.
 
 ### `cache-hub/lease`
 
@@ -509,6 +512,7 @@ import {
 | `decrement(key, amount?)` | Atomically decrements a counter while preserving TTL. |
 | `reset(key)` | Deletes one atomic state key. |
 | `resetPrefix(prefix)` | Deletes keys under a literal prefix with SCAN. |
+| `cleanupExpired(now?)` | Memory-only helper that removes expired counters and returns the number of removed entries. |
 
 ### `cache-hub/rate-limit`
 
@@ -534,6 +538,7 @@ import {
 | `consumeLeakyBucket(key, capacity, leakPerSecond, cost?)` | Atomically consumes leaky-bucket capacity and returns retry timing. |
 | `reset(key)` | Deletes one rate-limit key. |
 | `resetPrefix(prefix)` | Deletes keys under a literal prefix with SCAN. |
+| `cleanupExpired(now?)` | Memory-only helper that removes expired or naturally neutral rate-limit state. |
 
 ### `cache-hub/stringify`
 

@@ -66,6 +66,36 @@ describe('atomic state backends', () => {
             expect(backend.resetPrefix('missing:')).toBe(0);
         });
 
+        it('cleanupExpired 回收高基数过期计数器', () => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
+            const backend = new MemoryAtomicStateBackend();
+
+            for (let i = 0; i < 1000; i++) {
+                backend.incrementWithTtl(`atomic:${i}`, 1, 1000);
+            }
+
+            vi.setSystemTime(new Date('2026-06-01T00:00:01.001Z'));
+
+            expect(backend.cleanupExpired()).toBe(1000);
+            expect(backend.cleanupExpired()).toBe(0);
+            expect(backend.incrementWithTtl('atomic:new', 1, 1000).value).toBe(1);
+        });
+
+        it('cleanupExpired 保留未过期计数器并刷新下次清理时间', () => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
+            const backend = new MemoryAtomicStateBackend();
+
+            backend.incrementWithTtl('expired', 1, 1000);
+            backend.incrementWithTtl('live', 2, 5000);
+
+            vi.setSystemTime(new Date('2026-06-01T00:00:01.001Z'));
+
+            expect(backend.cleanupExpired()).toBe(1);
+            expect(backend.decrement('live')).toBe(1);
+        });
+
         it('校验非法参数', () => {
             const backend = new MemoryAtomicStateBackend();
 
@@ -149,4 +179,3 @@ describe('atomic state backends', () => {
         });
     });
 });
-

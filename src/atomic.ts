@@ -92,17 +92,58 @@ function createCounterResult(key: string, value: number, ttlMs: number | null): 
  */
 export class MemoryAtomicStateBackend implements AtomicStateBackend {
     private readonly _counters = new Map<string, AtomicCounterEntry>();
+    private _nextPruneAt = Number.POSITIVE_INFINITY;
+
+    private _trackPruneAt(expiresAt: number): void {
+        if (expiresAt < this._nextPruneAt) {
+            this._nextPruneAt = expiresAt;
+        }
+    }
+
+    private _refreshNextPruneAt(): void {
+        let nextPruneAt = Number.POSITIVE_INFINITY;
+        for (const entry of this._counters.values()) {
+            nextPruneAt = Math.min(nextPruneAt, entry.expiresAt);
+        }
+        this._nextPruneAt = nextPruneAt;
+    }
+
+    private _cleanupExpiredIfDue(now: number): number {
+        if (now < this._nextPruneAt) {
+            return 0;
+        }
+        return this.cleanupExpired(now);
+    }
+
+    cleanupExpired(now = Date.now()): number {
+        let count = 0;
+        let nextPruneAt = Number.POSITIVE_INFINITY;
+
+        for (const [key, entry] of this._counters) {
+            if (entry.expiresAt <= now) {
+                this._counters.delete(key);
+                count++;
+                continue;
+            }
+            nextPruneAt = Math.min(nextPruneAt, entry.expiresAt);
+        }
+
+        this._nextPruneAt = nextPruneAt;
+        return count;
+    }
 
     incrementWithTtl(key: string, delta: number, ttlMs: number): AtomicCounterResult {
         validateKey(key);
         const normalizedDelta = validatePositiveInteger('delta', delta);
         const normalizedTtlMs = validatePositiveInteger('ttlMs', ttlMs);
         const now = Date.now();
+        this._cleanupExpiredIfDue(now);
         let entry = this._counters.get(key);
 
         if (!entry || entry.expiresAt <= now) {
             entry = { value: 0, expiresAt: now + normalizedTtlMs };
             this._counters.set(key, entry);
+            this._trackPruneAt(entry.expiresAt);
         }
 
         entry.value += normalizedDelta;
@@ -113,13 +154,10 @@ export class MemoryAtomicStateBackend implements AtomicStateBackend {
         validateKey(key);
         const normalizedDelta = validatePositiveInteger('delta', delta);
         const now = Date.now();
+        this._cleanupExpiredIfDue(now);
         const entry = this._counters.get(key);
 
         if (!entry) {
-            return 0;
-        }
-        if (entry.expiresAt <= now) {
-            this._counters.delete(key);
             return 0;
         }
 
@@ -129,7 +167,12 @@ export class MemoryAtomicStateBackend implements AtomicStateBackend {
 
     reset(key: string): boolean {
         validateKey(key);
-        return this._counters.delete(key);
+        const entry = this._counters.get(key);
+        const deleted = this._counters.delete(key);
+        if (deleted && entry?.expiresAt === this._nextPruneAt) {
+            this._refreshNextPruneAt();
+        }
+        return deleted;
     }
 
     resetPrefix(prefix: string): number {
@@ -143,6 +186,9 @@ export class MemoryAtomicStateBackend implements AtomicStateBackend {
             }
         }
 
+        if (count > 0) {
+            this._refreshNextPruneAt();
+        }
         return count;
     }
 }

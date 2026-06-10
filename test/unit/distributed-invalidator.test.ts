@@ -100,6 +100,20 @@ function makeRedisMock() {
           handlers[event].push(handler);
         },
       ),
+    off: vi
+      .fn()
+      .mockImplementation(
+        (event: string, handler: (...args: any[]) => void) => {
+          handlers[event] = (handlers[event] ?? []).filter((h) => h !== handler);
+        },
+      ),
+    removeListener: vi
+      .fn()
+      .mockImplementation(
+        (event: string, handler: (...args: any[]) => void) => {
+          handlers[event] = (handlers[event] ?? []).filter((h) => h !== handler);
+        },
+      ),
     // ── 测试专用：手动触发事件 ──
     _triggerMessage(channel: string, raw: string): void {
       (handlers["message"] ?? []).forEach((h) => h(channel, raw));
@@ -111,6 +125,9 @@ function makeRedisMock() {
       if (_subscribeCallback) {
         _subscribeCallback(err);
       }
+    },
+    _listenerCount(event: string): number {
+      return (handlers[event] ?? []).length;
     },
   };
 }
@@ -903,6 +920,36 @@ describe("DistributedCacheInvalidator — close()", () => {
     const { invalidator } = makeInvalidator({}, makeRedisMock(), sub);
     await invalidator.close();
     expect(callOrder).toEqual(["unsubscribe", "quit"]);
+  });
+
+  it("close 后移除本实例注册的 pub/sub listener", async () => {
+    const { invalidator, pub, sub } = makeInvalidator();
+
+    expect(pub._listenerCount("error")).toBe(1);
+    expect(sub._listenerCount("error")).toBe(1);
+    expect(sub._listenerCount("message")).toBe(1);
+
+    await invalidator.close();
+
+    expect(pub._listenerCount("error")).toBe(0);
+    expect(sub._listenerCount("error")).toBe(0);
+    expect(sub._listenerCount("message")).toBe(0);
+  });
+
+  it("close 解绑 listener 时兼容 removeListener fallback", async () => {
+    const pub = makeRedisMock();
+    const sub = makeRedisMock();
+    delete (pub as any).off;
+    delete (sub as any).off;
+    const { invalidator } = makeInvalidator({}, pub, sub);
+
+    await invalidator.close();
+
+    expect(pub.removeListener).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(sub.removeListener).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(sub.removeListener).toHaveBeenCalledWith("message", expect.any(Function));
+    expect(pub._listenerCount("error")).toBe(0);
+    expect(sub._listenerCount("message")).toBe(0);
   });
 
   it("unsubscribe 失败时不向外抛出", async () => {

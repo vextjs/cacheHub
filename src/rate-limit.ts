@@ -172,14 +172,26 @@ interface SlidingWindowEntry {
     token: string;
 }
 
+interface SlidingWindowState {
+    entries: SlidingWindowEntry[];
+    windowMs: number;
+    expiresAt: number;
+}
+
 interface TokenBucketEntry {
     tokens: number;
     updatedAt: number;
+    capacity: number;
+    refillPerSecond: number;
+    expiresAt: number;
 }
 
 interface LeakyBucketEntry {
     level: number;
     updatedAt: number;
+    capacity: number;
+    leakPerSecond: number;
+    expiresAt: number;
 }
 
 interface ParsedBucketToken {
@@ -235,6 +247,25 @@ function createOpaqueToken(prefix: string): string {
 
 function createBucketRollbackToken(prefix: string, cost: number, capacity: number, ratePerSecond: number): string {
     return `${prefix}:${cost}:${capacity}:${ratePerSecond}`;
+}
+
+function calculateTokenBucketExpiresAt(
+    now: number,
+    tokens: number,
+    capacity: number,
+    refillPerSecond: number,
+): number {
+    if (tokens >= capacity) {
+        return now;
+    }
+    return now + Math.ceil((capacity - tokens) / refillPerSecond * 1000);
+}
+
+function calculateLeakyBucketExpiresAt(now: number, level: number, leakPerSecond: number): number {
+    if (level <= 0) {
+        return now;
+    }
+    return now + Math.ceil(level / leakPerSecond * 1000);
 }
 
 function parseBucketRollbackToken(prefix: string, rollbackToken: string): ParsedBucketToken {
@@ -366,6 +397,10 @@ export class MemoryFixedWindowRateLimitStore implements FixedWindowRateLimitStor
         validatePrefix(prefix);
         return this._atomic.resetPrefix(prefix);
     }
+
+    cleanupExpired(now = Date.now()): number {
+        return this._atomic.cleanupExpired(now);
+    }
 }
 
 /**
@@ -415,9 +450,144 @@ export class RedisFixedWindowRateLimitStore implements FixedWindowRateLimitStore
  */
 export class MemoryRateLimitStateStore implements RateLimitStateStore {
     private readonly _atomic = new MemoryAtomicStateBackend();
-    private readonly _slidingWindows = new Map<string, SlidingWindowEntry[]>();
+    private readonly _slidingWindows = new Map<string, SlidingWindowState>();
     private readonly _tokenBuckets = new Map<string, TokenBucketEntry>();
     private readonly _leakyBuckets = new Map<string, LeakyBucketEntry>();
+    private _nextPruneAt = Number.POSITIVE_INFINITY;
+
+    private _trackPruneAt(expiresAt: number): void {
+        if (expiresAt < this._nextPruneAt) {
+            this._nextPruneAt = expiresAt;
+        }
+    }
+
+    private _refreshNextPruneAt(): void {
+        let nextPruneAt = Number.POSITIVE_INFINITY;
+
+        for (const state of this._slidingWindows.values()) {
+            nextPruneAt = Math.min(nextPruneAt, state.expiresAt);
+        }
+        for (const entry of this._tokenBuckets.values()) {
+            nextPruneAt = Math.min(nextPruneAt, entry.expiresAt);
+        }
+        for (const entry of this._leakyBuckets.values()) {
+            nextPruneAt = Math.min(nextPruneAt, entry.expiresAt);
+        }
+
+        this._nextPruneAt = nextPruneAt;
+    }
+
+    private _cleanupExpiredIfDue(now: number): number {
+        if (now < this._nextPruneAt) {
+            return 0;
+        }
+        return this.cleanupExpired(now);
+    }
+
+    private _setSlidingWindowState(
+        key: string,
+        entries: SlidingWindowEntry[],
+        windowMs: number,
+    ): void {
+        if (entries.length === 0) {
+            if (this._slidingWindows.delete(key)) {
+                this._refreshNextPruneAt();
+            }
+            return;
+        }
+        const expiresAt = entries[entries.length - 1].timestamp + windowMs;
+        this._slidingWindows.set(key, { entries, windowMs, expiresAt });
+        this._trackPruneAt(expiresAt);
+    }
+
+    private _setTokenBucketEntry(
+        key: string,
+        tokens: number,
+        updatedAt: number,
+        capacity: number,
+        refillPerSecond: number,
+    ): void {
+        const expiresAt = calculateTokenBucketExpiresAt(updatedAt, tokens, capacity, refillPerSecond);
+        if (expiresAt <= updatedAt) {
+            if (this._tokenBuckets.delete(key)) {
+                this._refreshNextPruneAt();
+            }
+            return;
+        }
+        this._tokenBuckets.set(key, { tokens, updatedAt, capacity, refillPerSecond, expiresAt });
+        this._trackPruneAt(expiresAt);
+    }
+
+    private _setLeakyBucketEntry(
+        key: string,
+        level: number,
+        updatedAt: number,
+        capacity: number,
+        leakPerSecond: number,
+    ): void {
+        const expiresAt = calculateLeakyBucketExpiresAt(updatedAt, level, leakPerSecond);
+        if (expiresAt <= updatedAt) {
+            if (this._leakyBuckets.delete(key)) {
+                this._refreshNextPruneAt();
+            }
+            return;
+        }
+        this._leakyBuckets.set(key, { level, updatedAt, capacity, leakPerSecond, expiresAt });
+        this._trackPruneAt(expiresAt);
+    }
+
+    cleanupExpired(now = Date.now()): number {
+        let count = this._atomic.cleanupExpired(now);
+
+        for (const [key, state] of this._slidingWindows) {
+            const threshold = now - state.windowMs;
+            const entries = state.entries.filter((entry) => entry.timestamp > threshold);
+            if (entries.length === 0) {
+                this._slidingWindows.delete(key);
+                count++;
+                continue;
+            }
+            state.entries = entries;
+            state.expiresAt = entries[entries.length - 1].timestamp + state.windowMs;
+        }
+
+        for (const [key, entry] of this._tokenBuckets) {
+            const elapsedMs = Math.max(now - entry.updatedAt, 0);
+            const tokens = Math.min(
+                entry.capacity,
+                entry.tokens + elapsedMs * entry.refillPerSecond / 1000,
+            );
+            if (tokens >= entry.capacity) {
+                this._tokenBuckets.delete(key);
+                count++;
+                continue;
+            }
+            entry.tokens = tokens;
+            entry.updatedAt = now;
+            entry.expiresAt = calculateTokenBucketExpiresAt(
+                now,
+                tokens,
+                entry.capacity,
+                entry.refillPerSecond,
+            );
+        }
+
+        for (const [key, entry] of this._leakyBuckets) {
+            const elapsedMs = Math.max(now - entry.updatedAt, 0);
+            const level = Math.max(0, entry.level - elapsedMs * entry.leakPerSecond / 1000);
+            if (level <= 0) {
+                this._leakyBuckets.delete(key);
+                count++;
+                continue;
+            }
+            entry.level = level;
+            entry.updatedAt = now;
+            entry.expiresAt = calculateLeakyBucketExpiresAt(now, level, entry.leakPerSecond);
+        }
+
+        this._refreshNextPruneAt();
+        return count;
+    }
 
     checkSlidingWindow(key: string, windowMs: number, limit: number, cost = 1): SlidingWindowRateLimitResult {
         validateKey(key);
@@ -425,15 +595,16 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         const normalizedLimit = validatePositiveInteger('limit', limit);
         const normalizedCost = validatePositiveInteger('cost', cost);
         const now = Date.now();
+        this._cleanupExpiredIfDue(now);
         const threshold = now - normalizedWindowMs;
-        const entries = (this._slidingWindows.get(key) ?? []).filter((entry) => entry.timestamp > threshold);
+        const entries = (this._slidingWindows.get(key)?.entries ?? []).filter((entry) => entry.timestamp > threshold);
         const count = entries.length;
         const retryAfterMs = entries.length === 0
             ? normalizedWindowMs
             : Math.max(entries[0].timestamp + normalizedWindowMs - now, 0);
 
         if (count + normalizedCost > normalizedLimit) {
-            this._slidingWindows.set(key, entries);
+            this._setSlidingWindowState(key, entries, normalizedWindowMs);
             return createSlidingWindowResult(key, count, normalizedLimit, retryAfterMs, now);
         }
 
@@ -441,7 +612,7 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         for (let i = 0; i < normalizedCost; i++) {
             entries.push({ timestamp: now, token: `${rollbackToken}:${i}` });
         }
-        this._slidingWindows.set(key, entries);
+        this._setSlidingWindowState(key, entries, normalizedWindowMs);
 
         return createSlidingWindowResult(
             key,
@@ -456,16 +627,18 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
     rollbackSlidingWindow(key: string, rollbackToken: string): boolean {
         validateKey(key);
         validateKey(rollbackToken);
+        const now = Date.now();
+        this._cleanupExpiredIfDue(now);
         const tokens = new Set(rollbackToken.split('|'));
-        const entries = this._slidingWindows.get(key);
+        const state = this._slidingWindows.get(key);
 
-        if (!entries) {
+        if (!state) {
             return false;
         }
 
-        const next = entries.filter((entry) => !tokens.has(entry.token));
-        this._slidingWindows.set(key, next);
-        return next.length !== entries.length;
+        const next = state.entries.filter((entry) => !tokens.has(entry.token));
+        this._setSlidingWindowState(key, next, state.windowMs);
+        return next.length !== state.entries.length;
     }
 
     consumeTokenBucket(
@@ -479,7 +652,14 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         const normalizedRefillPerSecond = validatePositiveNumber('refillPerSecond', refillPerSecond);
         const normalizedCost = validatePositiveNumber('cost', cost);
         const now = Date.now();
-        const entry = this._tokenBuckets.get(key) ?? { tokens: normalizedCapacity, updatedAt: now };
+        this._cleanupExpiredIfDue(now);
+        const entry = this._tokenBuckets.get(key) ?? {
+            tokens: normalizedCapacity,
+            updatedAt: now,
+            capacity: normalizedCapacity,
+            refillPerSecond: normalizedRefillPerSecond,
+            expiresAt: now,
+        };
         const elapsedMs = Math.max(now - entry.updatedAt, 0);
         const tokens = Math.min(
             normalizedCapacity,
@@ -488,7 +668,7 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
 
         if (tokens < normalizedCost) {
             const retryAfterMs = Math.ceil((normalizedCost - tokens) / normalizedRefillPerSecond * 1000);
-            this._tokenBuckets.set(key, { tokens, updatedAt: now });
+            this._setTokenBucketEntry(key, tokens, now, normalizedCapacity, normalizedRefillPerSecond);
             return createTokenBucketResult(
                 key,
                 tokens,
@@ -500,7 +680,7 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         }
 
         const nextTokens = tokens - normalizedCost;
-        this._tokenBuckets.set(key, { tokens: nextTokens, updatedAt: now });
+        this._setTokenBucketEntry(key, nextTokens, now, normalizedCapacity, normalizedRefillPerSecond);
         return createTokenBucketResult(
             key,
             nextTokens,
@@ -514,15 +694,17 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
 
     rollbackTokenBucket(key: string, rollbackToken: string): boolean {
         validateKey(key);
-        const { cost, capacity } = parseBucketRollbackToken('tb', rollbackToken);
+        const now = Date.now();
+        this._cleanupExpiredIfDue(now);
+        const { cost, capacity, ratePerSecond } = parseBucketRollbackToken('tb', rollbackToken);
         const entry = this._tokenBuckets.get(key);
 
         if (!entry) {
             return false;
         }
 
-        entry.tokens = Math.min(entry.tokens + cost, capacity);
-        entry.updatedAt = Date.now();
+        const tokens = Math.min(entry.tokens + cost, capacity);
+        this._setTokenBucketEntry(key, tokens, now, capacity, ratePerSecond);
         return true;
     }
 
@@ -537,13 +719,20 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         const normalizedLeakPerSecond = validatePositiveNumber('leakPerSecond', leakPerSecond);
         const normalizedCost = validatePositiveNumber('cost', cost);
         const now = Date.now();
-        const entry = this._leakyBuckets.get(key) ?? { level: 0, updatedAt: now };
+        this._cleanupExpiredIfDue(now);
+        const entry = this._leakyBuckets.get(key) ?? {
+            level: 0,
+            updatedAt: now,
+            capacity: normalizedCapacity,
+            leakPerSecond: normalizedLeakPerSecond,
+            expiresAt: now,
+        };
         const elapsedMs = Math.max(now - entry.updatedAt, 0);
         const level = Math.max(0, entry.level - elapsedMs * normalizedLeakPerSecond / 1000);
 
         if (level + normalizedCost > normalizedCapacity) {
             const retryAfterMs = Math.ceil((level + normalizedCost - normalizedCapacity) / normalizedLeakPerSecond * 1000);
-            this._leakyBuckets.set(key, { level, updatedAt: now });
+            this._setLeakyBucketEntry(key, level, now, normalizedCapacity, normalizedLeakPerSecond);
             return createLeakyBucketResult(
                 key,
                 level,
@@ -555,7 +744,7 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         }
 
         const nextLevel = level + normalizedCost;
-        this._leakyBuckets.set(key, { level: nextLevel, updatedAt: now });
+        this._setLeakyBucketEntry(key, nextLevel, now, normalizedCapacity, normalizedLeakPerSecond);
         return createLeakyBucketResult(
             key,
             nextLevel,
@@ -569,15 +758,17 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
 
     rollbackLeakyBucket(key: string, rollbackToken: string): boolean {
         validateKey(key);
-        const { cost } = parseBucketRollbackToken('lb', rollbackToken);
+        const now = Date.now();
+        this._cleanupExpiredIfDue(now);
+        const { cost, capacity, ratePerSecond } = parseBucketRollbackToken('lb', rollbackToken);
         const entry = this._leakyBuckets.get(key);
 
         if (!entry) {
             return false;
         }
 
-        entry.level = Math.max(entry.level - cost, 0);
-        entry.updatedAt = Date.now();
+        const level = Math.max(entry.level - cost, 0);
+        this._setLeakyBucketEntry(key, level, now, capacity, ratePerSecond);
         return true;
     }
 
@@ -587,6 +778,9 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
         const slidingDeleted = this._slidingWindows.delete(key);
         const tokenDeleted = this._tokenBuckets.delete(key);
         const leakyDeleted = this._leakyBuckets.delete(key);
+        if (slidingDeleted || tokenDeleted || leakyDeleted) {
+            this._refreshNextPruneAt();
+        }
         return atomicDeleted || slidingDeleted || tokenDeleted || leakyDeleted;
     }
 
@@ -617,6 +811,9 @@ export class MemoryRateLimitStateStore implements RateLimitStateStore {
             this._leakyBuckets.delete(key);
         }
 
+        if (keys.size > 0) {
+            this._refreshNextPruneAt();
+        }
         return atomicCount + keys.size;
     }
 }

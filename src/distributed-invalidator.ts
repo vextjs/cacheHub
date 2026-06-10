@@ -196,6 +196,61 @@ export class DistributedCacheInvalidator {
   private readonly _shouldClosePub: boolean;
   private readonly _pub: any;
   private readonly _sub: any;
+  private readonly _handlePubError = (err: Error): void => {
+    this._stats.errors++;
+    this._logger?.error?.(
+      `[cache-hub/distributed] pub error: ${err.message}`,
+    );
+  };
+  private readonly _handleSubError = (err: Error): void => {
+    this._stats.errors++;
+    this._logger?.error?.(
+      `[cache-hub/distributed] sub error: ${err.message}`,
+    );
+  };
+  private readonly _handleMessage = (channel: string, raw: string): void => {
+    if (channel !== this._channel) {
+      return;
+    }
+
+    this._stats.messagesReceived++;
+
+    let msg: InvalidationMessage;
+    try {
+      msg = JSON.parse(raw) as InvalidationMessage;
+    } catch {
+      this._stats.errors++;
+      this._logger?.error?.(
+        "[cache-hub/distributed] message parse error: invalid JSON",
+      );
+      return;
+    }
+
+    // 忽略自身发送的消息（instanceId 过滤，避免本地重复失效）
+    if (msg.instanceId === this._instanceId) {
+      return;
+    }
+
+    if (
+      (msg.type === "invalidate" || msg.type === "invalidate-pattern") &&
+      "pattern" in msg &&
+      typeof msg.pattern === "string" &&
+      msg.pattern.length > 0
+    ) {
+      // 异步处理，不阻塞 Redis 消息循环；错误在 _invalidateLocal 内捕获
+      void this._invalidatePatternLocal(msg.pattern);
+      return;
+    }
+
+    if (
+      msg.type === "invalidate-tag" &&
+      "tag" in msg &&
+      typeof msg.tag === "string" &&
+      msg.tag.length > 0
+    ) {
+      void this._invalidateTagLocal(msg.tag);
+    }
+  };
   private readonly _stats: {
     messagesSent: number;
     messagesReceived: number;
@@ -246,19 +301,8 @@ export class DistributedCacheInvalidator {
    * @private
    */
   private _setupSubscription(): void {
-    this._pub.on("error", (err: Error) => {
-      this._stats.errors++;
-      this._logger?.error?.(
-        `[cache-hub/distributed] pub error: ${err.message}`,
-      );
-    });
-
-    this._sub.on("error", (err: Error) => {
-      this._stats.errors++;
-      this._logger?.error?.(
-        `[cache-hub/distributed] sub error: ${err.message}`,
-      );
-    });
+    this._pub.on("error", this._handlePubError);
+    this._sub.on("error", this._handleSubError);
 
     // 订阅目标频道
     this._sub.subscribe(this._channel, (err: Error | null) => {
@@ -275,49 +319,23 @@ export class DistributedCacheInvalidator {
     });
 
     // 注册消息处理器
-    this._sub.on("message", (channel: string, raw: string) => {
-      if (channel !== this._channel) {
-        return;
-      }
+    this._sub.on("message", this._handleMessage);
+  }
 
-      this._stats.messagesReceived++;
+  private _removeListener(target: any, event: string, handler: (...args: any[]) => void): void {
+    if (typeof target.off === "function") {
+      target.off(event, handler);
+      return;
+    }
+    if (typeof target.removeListener === "function") {
+      target.removeListener(event, handler);
+    }
+  }
 
-      let msg: InvalidationMessage;
-      try {
-        msg = JSON.parse(raw) as InvalidationMessage;
-      } catch {
-        this._stats.errors++;
-        this._logger?.error?.(
-          "[cache-hub/distributed] message parse error: invalid JSON",
-        );
-        return;
-      }
-
-      // 忽略自身发送的消息（instanceId 过滤，避免本地重复失效）
-      if (msg.instanceId === this._instanceId) {
-        return;
-      }
-
-      if (
-        (msg.type === "invalidate" || msg.type === "invalidate-pattern") &&
-        "pattern" in msg &&
-        typeof msg.pattern === "string" &&
-        msg.pattern.length > 0
-      ) {
-        // 异步处理，不阻塞 Redis 消息循环；错误在 _invalidateLocal 内捕获
-        void this._invalidatePatternLocal(msg.pattern);
-        return;
-      }
-
-      if (
-        msg.type === "invalidate-tag" &&
-        "tag" in msg &&
-        typeof msg.tag === "string" &&
-        msg.tag.length > 0
-      ) {
-        void this._invalidateTagLocal(msg.tag);
-      }
-    });
+  private _detachListeners(): void {
+    this._removeListener(this._pub, "error", this._handlePubError);
+    this._removeListener(this._sub, "error", this._handleSubError);
+    this._removeListener(this._sub, "message", this._handleMessage);
   }
 
   /**
@@ -479,6 +497,8 @@ export class DistributedCacheInvalidator {
         `[cache-hub/distributed] unsubscribe error: ${(err as Error).message}`,
       );
     }
+
+    this._detachListeners();
 
     // 关闭 sub 连接（始终自行创建）
     try {

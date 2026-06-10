@@ -23,6 +23,7 @@ vi.mock("module", async (importOriginal) => {
     mget = vi.fn().mockResolvedValue([]);
     smembers = vi.fn().mockResolvedValue([]);
     sscan = vi.fn().mockResolvedValue(["0", []]);
+    srem = vi.fn().mockResolvedValue(1);
     scan = vi.fn().mockResolvedValue(["0", []]);
     pipeline = vi.fn().mockReturnValue({
       set: vi.fn().mockReturnThis(),
@@ -31,6 +32,7 @@ vi.mock("module", async (importOriginal) => {
       pttl: vi.fn().mockReturnThis(),
       sadd: vi.fn().mockReturnThis(),
       srem: vi.fn().mockReturnThis(),
+      pexpire: vi.fn().mockReturnThis(),
       exec: vi.fn().mockResolvedValue([]),
     });
     quit = vi.fn().mockResolvedValue("OK");
@@ -65,6 +67,7 @@ function makeMockRedis() {
     pttl: vi.fn().mockReturnThis(),
     sadd: vi.fn().mockReturnThis(),
     srem: vi.fn().mockReturnThis(),
+    pexpire: vi.fn().mockReturnThis(),
     exec: vi.fn().mockResolvedValue([]),
   };
 
@@ -79,6 +82,7 @@ function makeMockRedis() {
     mget: vi.fn().mockResolvedValue([]),
     smembers: vi.fn().mockResolvedValue([]),
     sscan: vi.fn().mockResolvedValue(["0", []]),
+    srem: vi.fn().mockResolvedValue(1),
     pipeline: vi.fn().mockReturnValue(pipelineMock),
     scan: vi.fn().mockResolvedValue(["0", []]),
     quit: vi.fn().mockResolvedValue("OK"),
@@ -227,7 +231,32 @@ describe("RedisCacheAdapter", () => {
         "user",
         "tenant",
       );
+      expect(redis._pipeline.pexpire).toHaveBeenCalledWith(
+        expect.stringContaining(":key-tags:"),
+        1000,
+      );
       expect(redis._pipeline.exec).toHaveBeenCalledOnce();
+    });
+
+    it("set 带 tags 但无 TTL 时不设置 key-tags TTL", async () => {
+      const { adapter, redis } = makeAdapter();
+
+      await adapter.set("k", "v", undefined, { tags: ["user"] });
+
+      expect(redis._pipeline.pexpire).not.toHaveBeenCalled();
+    });
+
+    it("set 带 tags 时只执行有界 stale metadata prune", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.sscan.mockResolvedValue([
+        "0",
+        Array.from({ length: 20 }, (_, i) => `stale:${i}`),
+      ]);
+      redis.exists.mockResolvedValue(0);
+
+      await adapter.set("k", "v", 1000, { tags: ["user"] });
+
+      expect(redis.srem).toHaveBeenCalledTimes(16);
     });
 
     it("set 去重 tags，并拒绝空 tag", async () => {
@@ -807,6 +836,42 @@ describe("RedisCacheAdapter", () => {
 
       expect(await (adapter as any)._deleteKeys([])).toBe(0);
       expect(redis.del).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("pruneTagMetadata", () => {
+    it("使用 SSCAN 清理已自然过期 key 的 tag metadata", async () => {
+      const { adapter, redis } = makeAdapter();
+      redis.sscan.mockResolvedValue(["0", ["stale", "live"]]);
+      redis.exists.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+      redis.smembers.mockResolvedValueOnce(["user", "tenant"]);
+
+      const count = await adapter.pruneTagMetadata!("user");
+
+      expect(count).toBe(1);
+      expect(redis.sscan).toHaveBeenCalledWith(
+        expect.stringContaining(":tag:"),
+        "0",
+        "COUNT",
+        100,
+      );
+      expect(redis._pipeline.srem).toHaveBeenCalledWith(
+        expect.stringContaining(":tag:"),
+        "stale",
+      );
+      expect(redis.srem).toHaveBeenCalledWith(
+        redis.sscan.mock.calls[0][0],
+        "stale",
+      );
+      expect(redis._pipeline.del).toHaveBeenCalledWith(
+        expect.stringContaining(":key-tags:"),
+      );
+    });
+
+    it("空 tag 抛出 TypeError", async () => {
+      const { adapter } = makeAdapter();
+
+      await expect(adapter.pruneTagMetadata!("")).rejects.toThrow(TypeError);
     });
   });
 

@@ -95,6 +95,21 @@ describe('rate-limit fixed-window primitives', () => {
             expect(store.resetPrefix('none:')).toBe(0);
         });
 
+        it('cleanupExpired 回收过期固定窗口计数', () => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
+            const store = new MemoryFixedWindowRateLimitStore();
+
+            for (let i = 0; i < 1000; i++) {
+                store.increment(`rl:user:${i}`, 1000, 10);
+            }
+
+            vi.setSystemTime(new Date('2026-06-01T00:00:01.001Z'));
+
+            expect(store.cleanupExpired()).toBe(1000);
+            expect(store.cleanupExpired()).toBe(0);
+        });
+
         it('校验非法参数', () => {
             const store = new MemoryFixedWindowRateLimitStore();
 
@@ -215,6 +230,10 @@ describe('rate-limit fixed-window primitives', () => {
             expect(store.rollbackSlidingWindow('sw:user:1', first.rollbackToken!)).toBe(false);
             expect(store.rollbackSlidingWindow('missing', first.rollbackToken!)).toBe(false);
 
+            const single = store.checkSlidingWindow('sw:single', 1000, 2);
+            expect(store.rollbackSlidingWindow('sw:single', single.rollbackToken!)).toBe(true);
+            expect(store.rollbackSlidingWindow('sw:single', single.rollbackToken!)).toBe(false);
+
             vi.setSystemTime(new Date('2026-06-01T00:00:01.001Z'));
             expect(store.checkSlidingWindow('sw:user:1', 1000, 2).count).toBe(1);
         });
@@ -272,6 +291,41 @@ describe('rate-limit fixed-window primitives', () => {
             expect(store.reset('missing')).toBe(false);
             expect(store.resetPrefix('rl:')).toBe(3);
             expect(store.resetPrefix('none:')).toBe(0);
+        });
+
+        it('cleanupExpired 回收 sliding/token/leaky 高基数中性状态', () => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
+            const store = new MemoryRateLimitStateStore();
+
+            for (let i = 0; i < 100; i++) {
+                store.checkSlidingWindow(`sw:${i}`, 1000, 10);
+                store.consumeTokenBucket(`tb:${i}`, 3, 1, 3);
+                store.consumeLeakyBucket(`lb:${i}`, 3, 1, 3);
+            }
+
+            vi.setSystemTime(new Date('2026-06-01T00:00:03.001Z'));
+
+            expect(store.cleanupExpired()).toBe(300);
+            expect(store.cleanupExpired()).toBe(0);
+            expect(store.rollbackTokenBucket('tb:1', 'tb:3:3:1')).toBe(false);
+            expect(store.rollbackLeakyBucket('lb:1', 'lb:3:3:1')).toBe(false);
+        });
+
+        it('cleanupExpired 保留尚未自然补满或漏空的 bucket 状态', () => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
+            const store = new MemoryRateLimitStateStore();
+
+            store.checkSlidingWindow('sw:active', 5000, 10);
+            store.consumeTokenBucket('tb:slow', 3, 1, 3);
+            store.consumeLeakyBucket('lb:slow', 3, 1, 3);
+
+            vi.setSystemTime(new Date('2026-06-01T00:00:01.000Z'));
+            expect(store.cleanupExpired()).toBe(0);
+
+            vi.setSystemTime(new Date('2026-06-01T00:00:03.001Z'));
+            expect(store.cleanupExpired()).toBe(2);
         });
 
         it('校验状态原语非法参数与无状态回滚', () => {

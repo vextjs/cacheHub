@@ -399,10 +399,13 @@ Redis adapter 实现 `CacheLike`，并额外提供：
 | `getRemainingTtl(key)` | 返回剩余 TTL 毫秒数；不过期 key 返回 `null`，不存在 key 返回 `undefined`。 |
 | `getRemainingTtlMany(keys)` | 批量查询 TTL。 |
 | `invalidateByTag(tag)` | 删除绑定该 tag 的业务缓存 key，并返回删除数量。 |
+| `pruneTagMetadata(tag)` | 可选维护方法：清理已经自然过期业务 key 留下的 tag metadata。 |
 | `close()` | 只关闭 adapter 自己创建的连接；外部传入的 ioredis 实例不会被关闭。 |
 | `getRedisInstance()` | 返回底层 ioredis 实例，供高级场景使用。 |
 
 模式操作使用 `SCAN COUNT 100`，不会使用 `KEYS`。
+带 TTL 的 tag 写入会给反向 `key-tags` metadata 设置相同 TTL。
+tag set 本身不会直接设置 TTL，因为同一个 tag 可能同时包含不过期 key 和短 TTL key。
 
 ### `cache-hub/lease`
 
@@ -484,6 +487,7 @@ import {
 | `decrement(key, amount?)` | 原子递减计数器并保留 TTL。 |
 | `reset(key)` | 删除单个原子状态 key。 |
 | `resetPrefix(prefix)` | 使用 SCAN 删除字面量前缀下的 key。 |
+| `cleanupExpired(now?)` | 仅内存实现提供：清理过期 counter，并返回清理数量。 |
 
 ### `cache-hub/rate-limit`
 
@@ -509,6 +513,7 @@ import {
 | `consumeLeakyBucket(key, capacity, leakPerSecond, cost?)` | 原子消耗 leaky bucket 容量，并返回重试时间。 |
 | `reset(key)` | 删除单个限流 key。 |
 | `resetPrefix(prefix)` | 使用 SCAN 删除字面量前缀下的限流 key。 |
+| `cleanupExpired(now?)` | 仅内存实现提供：清理过期或已自然中性化的限流状态。 |
 
 ### `cache-hub/stringify`
 

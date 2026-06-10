@@ -21,6 +21,7 @@ import { createHash } from 'crypto';
 const SCAN_COUNT = 100;
 const PATTERN_MAX_LENGTH = 512;
 const DEFAULT_META_KEY_PREFIX = '__cache-hub';
+const TAG_PRUNE_BATCH_SIZE = 16;
 
 // ── 动态加载 ioredis（optional peer dep）──
 
@@ -66,6 +67,8 @@ export interface RedisCacheAdapter extends CacheLike {
     getRedisInstance(): object;
     /** 按 tag 失效缓存条目 */
     invalidateByTag(tag: string): Promise<number>;
+    /** 惰性清理指定 tag 下已自然过期的 metadata。可选扩展，避免破坏自实现接口的消费方。 */
+    pruneTagMetadata?(tag: string): Promise<number>;
 }
 
 // ── 内部实现类 ──
@@ -182,7 +185,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         await pipeline.exec();
     }
 
-    private async _replaceTagsForKey(key: string, tags: string[]): Promise<void> {
+    private async _replaceTagsForKey(key: string, tags: string[], ttl?: number): Promise<void> {
         await this._cleanupTagsForKey(key);
         if (tags.length === 0) {
             return;
@@ -191,8 +194,51 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         for (const tag of tags) {
             pipeline.sadd(this._tagKey(tag), key);
         }
-        pipeline.sadd(this._keyTagsKey(key), ...tags);
+        const keyTagsKey = this._keyTagsKey(key);
+        pipeline.sadd(keyTagsKey, ...tags);
+        if (ttl !== undefined && ttl > 0) {
+            pipeline.pexpire(keyTagsKey, ttl);
+        }
         await pipeline.exec();
+    }
+
+    private async _pruneTagMetadata(tag: string, maxEntries = Number.POSITIVE_INFINITY): Promise<number> {
+        this._validateTag(tag);
+        const tagKey = this._tagKey(tag);
+        let cursor = '0';
+        let removed = 0;
+        let visited = 0;
+
+        do {
+            const [nextCursor, keys]: [string, string[]] = await this._redis.sscan(
+                tagKey,
+                cursor,
+                'COUNT',
+                this._scanCount
+            );
+            cursor = nextCursor;
+
+            for (const key of keys) {
+                if (visited >= maxEntries) {
+                    return removed;
+                }
+                visited++;
+                if (await this.exists(key)) {
+                    continue;
+                }
+                await this._cleanupTagsForKey(key, tag);
+                await this._redis.srem(tagKey, key);
+                removed++;
+            }
+        } while (cursor !== '0');
+
+        return removed;
+    }
+
+    private async _pruneTouchedTags(tags: string[]): Promise<void> {
+        for (const tag of tags) {
+            await this._pruneTagMetadata(tag, TAG_PRUNE_BATCH_SIZE);
+        }
     }
 
     private _deleteInPipeline(pipeline: any, key: string): void {
@@ -279,7 +325,10 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         } else {
             await this._redis.set(key, serialized);
         }
-        await this._replaceTagsForKey(key, tags ?? []);
+        await this._replaceTagsForKey(key, tags ?? [], ttl);
+        if (tags !== undefined && tags.length > 0) {
+            await this._pruneTouchedTags(tags);
+        }
     }
 
     async del(key: string): Promise<boolean> {
@@ -344,7 +393,7 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
         }
         await pipeline.exec();
         for (const key of keys) {
-            await this._replaceTagsForKey(key, []);
+            await this._replaceTagsForKey(key, [], ttl);
         }
         return true;
     }
@@ -444,6 +493,10 @@ class RedisCacheAdapterImpl implements RedisCacheAdapter {
 
         await this._redis.del(tagKey);
         return count;
+    }
+
+    async pruneTagMetadata(tag: string): Promise<number> {
+        return this._pruneTagMetadata(tag);
     }
 
     async getRemainingTtl(key: string): Promise<CacheRemainingTtl | undefined> {
