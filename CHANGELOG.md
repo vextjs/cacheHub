@@ -24,6 +24,7 @@
 
 | 版本 | 日期 | 变更摘要 | 详细 |
 |------|------|---------|------|
+| [v2.2.4](./changelogs/v2.2.4.md) | 2026-06-11 | Patch 更新：新增方法级内存压力探针 `test:memory`，补强资源泄露修复后的发布验证链 | [查看](./changelogs/v2.2.4.md) |
 | [v2.2.3](./changelogs/v2.2.3.md) | 2026-06-11 | Patch 修复：收口内存状态、分布式失效 listener 与 Redis tag metadata 资源生命周期 | [查看](./changelogs/v2.2.3.md) |
 | [v2.2.2](./changelogs/v2.2.2.md) | 2026-06-09 | Patch 更新：固定 direct devDependencies 为精确版本，避免本仓验证链依赖范围漂移 | [查看](./changelogs/v2.2.2.md) |
 | [v2.2.1](./changelogs/v2.2.1.md) | 2026-06-04 | Patch 更新：许可证元数据与 npm 包分发口径迁移到 Apache-2.0 | [查看](./changelogs/v2.2.1.md) |
@@ -39,6 +40,7 @@
 
 | 版本 | 新增 | 变更 | 修复 | 移除 |
 |------|------|------|------|------|
+| v2.2.4 | `scripts/memory-leak-pressure.mjs` 与 `npm run test:memory` | 发布包 files 边界纳入内存压测脚本；Profile 测试规范补充内存压力测试路线 | - | - |
 | v2.2.3 | 内存状态 `cleanupExpired()` 与 Redis `pruneTagMetadata()` 可选维护能力 | 带 TTL 的 Redis tag 反向索引同步 TTL；分布式失效 close 解绑 listener | 高基数内存状态、EventEmitter listener、Redis tag metadata 资源生命周期收口 | - |
 | v2.2.2 | - | direct devDependencies 固定为 package-lock 已解析精确版本 | - | - |
 | v2.2.1 | - | 许可证元数据、LICENSE、README badge 与 root lockfile 迁移到 Apache-2.0 | - | - |

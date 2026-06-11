@@ -1,6 +1,6 @@
 {
   "name": "cache-hub",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "types": "./dist/types/index.d.ts",
@@ -93,7 +93,8 @@
     "CHANGELOG.md",
     "changelogs",
     "docs",
-    "scripts/benchmark.mjs"
+    "scripts/benchmark.mjs",
+    "scripts/memory-leak-pressure.mjs"
   ],
   "publishConfig": {
     "access": "public"
@@ -124,11 +125,13 @@
     "test:coverage": "vitest run --coverage",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:integration:coverage": "vitest run --config vitest.integration.config.ts --coverage",
+    "test:memory": "node --expose-gc scripts/memory-leak-pressure.mjs",
+    "test:memory:build": "npm run build && npm run test:memory",
     "build": "rimraf dist && npm run build:esm && npm run build:cjs && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
     "build:esm": "tsc -p tsconfig.json",
     "build:cjs": "node scripts/build-cjs.mjs",
     "benchmark": "npm run build && node scripts/benchmark.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run test:integration && npm run build"
+    "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run test:integration && npm run build && npm run test:memory"
   }
 }
